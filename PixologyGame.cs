@@ -31,7 +31,8 @@ public sealed class PixologyGame : Game
         Erase,
         PaintBucket,
         Crop,
-        Eyedropper
+        Eyedropper,
+        Select
     }
 
     private enum CropDragMode
@@ -48,7 +49,21 @@ public sealed class PixologyGame : Game
         BottomRight
     }
 
-    private sealed record CanvasSnapshot(int Width, int Height, Color[] Pixels);
+    private sealed class Layer
+    {
+        public required string Name { get; set; }
+        public required Color[] Pixels { get; set; }
+        public float Opacity { get; set; } = 1f;
+    }
+
+    private sealed record LayerSnapshot(string Name, float Opacity, Color[] Pixels);
+    private sealed record CanvasSnapshot(
+        int Width,
+        int Height,
+        LayerSnapshot[] Layers,
+        int ActiveLayerIndex,
+        int ChangedLayerIndex,
+        Color[] ChangedLayerPixels);
     private sealed record OpenFileEntry(string Name, string Path, bool IsDirectory);
 
     private enum ColorPickerDrag
@@ -60,6 +75,7 @@ public sealed class PixologyGame : Game
 
     private readonly GraphicsDeviceManager _graphics;
     private readonly Stack<CanvasSnapshot> _undoHistory = new();
+    private readonly List<Layer> _layers = new();
     private SpriteBatch _spriteBatch = null!;
     private SpriteFont _font = null!;
     private SpriteFont _titleFont = null!;
@@ -70,6 +86,7 @@ public sealed class PixologyGame : Game
     private Texture2D _hueTexture = null!;
     private RasterizerState _canvasRasterizer = null!;
     private Color[] _canvasPixels = null!;
+    private Color[] _compositePixels = null!;
     private int _canvasWidth = InitialCanvasSize;
     private int _canvasHeight = InitialCanvasSize;
     private bool _isEditing;
@@ -88,16 +105,38 @@ public sealed class PixologyGame : Game
     private float _selectedSaturation = 1f;
     private float _selectedValue = 1f;
     private Color _selectedColor = Color.Red;
-    private Color[] _strokeSnapshot = Array.Empty<Color>();
+    private CanvasSnapshot _strokeDocumentSnapshot = null!;
+    private CanvasSnapshot _opacityDocumentSnapshot = null!;
+    private bool _isAdjustingLayerOpacity;
+    private bool _layerOpacityChanged;
+    private int _activeLayerIndex;
+    private int _layerListOffset;
     private Point _cropDragStart;
     private Rectangle _cropSelection;
     private Rectangle _cropDragSelection;
     private CropDragMode _cropDragMode;
+    private bool _isMovingSelection;
+    private bool _selectionMoveChanged;
+    private Point _selectionDragStart;
+    private Rectangle _selectionMoveBounds;
+    private Point _selectionMoveOffset;
+    private Rectangle _selectionBounds;
+    private CanvasSnapshot _selectionMoveSnapshot = null!;
     private readonly List<OpenFileEntry> _openFileEntries = new();
     private string _openDirectory = string.Empty;
     private string _openFileMessage = string.Empty;
     private int _selectedOpenFileEntry = -1;
     private int _openFileListOffset;
+    private int _lastFileClickEntry = -1;
+    private double _lastFileClickTime;
+    private Point _layerContextMenuPosition;
+    private int _contextMenuLayerIndex = -1;
+    private bool _isLayerContextMenuOpen;
+    private bool _isDraggingLayer;
+    private int _draggedLayerIndex = -1;
+    private int _layerDropTargetIndex = -1;
+    private Point _layerDragStartPosition;
+    private bool _layerDragMoved;
     private Vector2 _canvasPan;
     private float _zoom = 1f;
     private MacTrackpadPinch _trackpadPinch = null!;
@@ -130,6 +169,7 @@ public sealed class PixologyGame : Game
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
         _canvasPixels = new Color[_canvasWidth * _canvasHeight];
+        _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
         RebuildCanvasTextures();
         _saturationValueTexture = new Texture2D(GraphicsDevice, 144, 144);
         _hueTexture = new Texture2D(GraphicsDevice, 20, 144);
@@ -173,6 +213,9 @@ public sealed class PixologyGame : Game
                 ActivateCropTool();
             else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.I))
                 _activeTool = EditorTool.Eyedropper;
+            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.V) &&
+                     !_previousKeyboard.IsKeyDown(Keys.V))
+                ActivateSelectionTool();
 
             if (keyboard.IsKeyDown(Keys.G) && !_previousKeyboard.IsKeyDown(Keys.G))
                 _showGrid = !_showGrid;
@@ -184,6 +227,8 @@ public sealed class PixologyGame : Game
             {
                 if (_isDrawingStroke)
                     FinishStroke();
+                if (_isMovingSelection)
+                    FinishSelectionMove();
                 Undo();
             }
         }
@@ -191,21 +236,44 @@ public sealed class PixologyGame : Game
         var mouse = Mouse.GetState();
         var leftPressed = mouse.LeftButton == ButtonState.Pressed;
         var middlePressed = mouse.MiddleButton == ButtonState.Pressed;
+        var rightPressed = mouse.RightButton == ButtonState.Pressed;
         var spacePressed = keyboard.IsKeyDown(Keys.Space);
         var justPressedLeft = leftPressed && _previousMouse.LeftButton == ButtonState.Released;
+        var justPressedRight = rightPressed && _previousMouse.RightButton == ButtonState.Released;
         var justPressedMiddle = middlePressed && _previousMouse.MiddleButton == ButtonState.Released;
 
         if (_showOpenFileDialog)
         {
-            UpdateOpenFileDialog(mouse, keyboard, justPressedLeft);
+            UpdateOpenFileDialog(mouse, keyboard, justPressedLeft, gameTime.TotalGameTime.TotalSeconds);
             _previousMouse = mouse;
             _previousKeyboard = keyboard;
             base.Update(gameTime);
             return;
         }
 
-        if (_isEditing && (mouse.ScrollWheelValue != _previousMouse.ScrollWheelValue ||
-                           mouse.HorizontalScrollWheelValue != _previousMouse.HorizontalScrollWheelValue))
+        if (_isEditing && justPressedRight)
+            HandleLayerPanelRightClick(mouse.Position);
+
+        if (_isAdjustingLayerOpacity && leftPressed)
+            UpdateLayerOpacity(mouse.Position);
+        if (_isAdjustingLayerOpacity && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
+        {
+            _isAdjustingLayerOpacity = false;
+            if (_layerOpacityChanged)
+                _undoHistory.Push(_opacityDocumentSnapshot);
+            _opacityDocumentSnapshot = null!;
+            _layerOpacityChanged = false;
+            RefreshCompositeTexture();
+        }
+
+        if (_isEditing && mouse.ScrollWheelValue != _previousMouse.ScrollWheelValue &&
+            GetLayerListBounds(GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport))).Contains(mouse.Position))
+        {
+            var scrollDirection = Math.Sign(_previousMouse.ScrollWheelValue - mouse.ScrollWheelValue);
+            SetLayerListOffset(_layerListOffset + scrollDirection);
+        }
+        else if (_isEditing && (mouse.ScrollWheelValue != _previousMouse.ScrollWheelValue ||
+                                mouse.HorizontalScrollWheelValue != _previousMouse.HorizontalScrollWheelValue))
         {
             HandleScroll(mouse);
         }
@@ -221,6 +289,8 @@ public sealed class PixologyGame : Game
                 BeginCrop(mouse.Position);
             else if (_activeTool == EditorTool.Eyedropper)
                 SampleCanvasColor(mouse.Position);
+            else if (_activeTool == EditorTool.Select)
+                BeginSelectionMove(mouse.Position);
             else if (_activeTool != EditorTool.Crop && IsInsideCanvas(mouse.Position))
                 BeginStroke();
         }
@@ -245,6 +315,10 @@ public sealed class PixologyGame : Game
 
         if (_isCropping && leftPressed)
             UpdateCrop(mouse.Position);
+        if (_isMovingSelection && leftPressed)
+            UpdateSelectionMove(mouse.Position);
+        if (_isDraggingLayer && leftPressed)
+            UpdateLayerDrag(mouse.Position);
 
         if (_isEditing && _colorPickerDrag != ColorPickerDrag.None && leftPressed)
             UpdateColorPicker(mouse.Position);
@@ -255,6 +329,10 @@ public sealed class PixologyGame : Game
             FinishStroke();
         if (_isCropping && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
             FinishCrop();
+        if (_isMovingSelection && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
+            FinishSelectionMove();
+        if (_isDraggingLayer && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
+            FinishLayerDrag();
 
         if (_isPanning && !middlePressed && !(leftPressed && spacePressed))
             _isPanning = false;
@@ -368,7 +446,11 @@ public sealed class PixologyGame : Game
         DrawButton(cancelButton, "Cancel", mouse);
     }
 
-    private void UpdateOpenFileDialog(MouseState mouse, KeyboardState keyboard, bool justPressedLeft)
+    private void UpdateOpenFileDialog(
+        MouseState mouse,
+        KeyboardState keyboard,
+        bool justPressedLeft,
+        double currentTime)
     {
         if (keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape))
         {
@@ -395,6 +477,9 @@ public sealed class PixologyGame : Game
         if (!justPressedLeft)
             return;
 
+        var previousFileClickEntry = _lastFileClickEntry;
+        var previousFileClickTime = _lastFileClickTime;
+        _lastFileClickEntry = -1;
         var dialog = GetOpenFileDialogBounds();
         var upButton = new Rectangle(dialog.X + 16, dialog.Y + 66, 76, 30);
         var homeButton = new Rectangle(upButton.Right + 8, upButton.Y, 84, 30);
@@ -417,7 +502,18 @@ public sealed class PixologyGame : Game
             var row = (mouse.Y - listBounds.Y - 1) / rowHeight;
             var entryIndex = _openFileListOffset + row;
             if (row >= 0 && entryIndex < _openFileEntries.Count)
+            {
                 SelectOpenFileEntry(entryIndex);
+                if (entryIndex == previousFileClickEntry && currentTime - previousFileClickTime <= 0.5)
+                {
+                    OpenSelectedFileEntry();
+                }
+                else
+                {
+                    _lastFileClickEntry = entryIndex;
+                    _lastFileClickTime = currentTime;
+                }
+            }
             return;
         }
 
@@ -430,15 +526,73 @@ public sealed class PixologyGame : Game
 
     private void ShowOpenFileDialog()
     {
-        var picturesDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
-        _openDirectory = Directory.Exists(picturesDirectory)
-            ? picturesDirectory
-            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        _openFileMessage = string.Empty;
+        var preferenceMessage = string.Empty;
+        if (string.IsNullOrEmpty(_openDirectory))
+        {
+            _openDirectory = LoadLastOpenDirectory();
+            preferenceMessage = _openFileMessage;
+        }
+
         _selectedOpenFileEntry = -1;
         _openFileListOffset = 0;
-        _openFileMessage = string.Empty;
         _showOpenFileDialog = true;
         RefreshOpenFileEntries();
+        if (preferenceMessage.Length > 0)
+            _openFileMessage = preferenceMessage;
+    }
+
+    private string LoadLastOpenDirectory()
+    {
+        try
+        {
+            var preferencePath = GetOpenDirectoryPreferencePath();
+            if (File.Exists(preferencePath))
+            {
+                var savedDirectory = File.ReadAllText(preferencePath).Trim();
+                if (Directory.Exists(savedDirectory))
+                    return savedDirectory;
+            }
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            _openFileMessage = $"Cannot read last folder setting: {exception.Message}";
+        }
+        catch (IOException exception)
+        {
+            _openFileMessage = $"Cannot read last folder setting: {exception.Message}";
+        }
+
+        var desktopDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        return Directory.Exists(desktopDirectory)
+            ? desktopDirectory
+            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    }
+
+    private static string GetOpenDirectoryPreferencePath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Pixology",
+            "last-open-directory.txt");
+    }
+
+    private void SaveLastOpenDirectory()
+    {
+        try
+        {
+            var preferencePath = GetOpenDirectoryPreferencePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(preferencePath)!);
+            File.WriteAllText(preferencePath, _openDirectory);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            _openFileMessage = $"Cannot save last folder setting: {exception.Message}";
+        }
+        catch (IOException exception)
+        {
+            _openFileMessage = $"Cannot save last folder setting: {exception.Message}";
+        }
     }
 
     private void RefreshOpenFileEntries()
@@ -511,6 +665,7 @@ public sealed class PixologyGame : Game
         {
             _openDirectory = entry.Path;
             RefreshOpenFileEntries();
+            SaveLastOpenDirectory();
             return;
         }
 
@@ -525,12 +680,14 @@ public sealed class PixologyGame : Game
 
         _openDirectory = parent.FullName;
         RefreshOpenFileEntries();
+        SaveLastOpenDirectory();
     }
 
     private void NavigateToHomeDirectory()
     {
         _openDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         RefreshOpenFileEntries();
+        SaveLastOpenDirectory();
     }
 
     private void LoadImageFile(string path)
@@ -550,6 +707,10 @@ public sealed class PixologyGame : Game
             _canvasWidth = image.Width;
             _canvasHeight = image.Height;
             _canvasPixels = pixels;
+            _layers.Clear();
+            _layers.Add(new Layer { Name = Path.GetFileNameWithoutExtension(path), Pixels = pixels });
+            _activeLayerIndex = 0;
+            _layerListOffset = 0;
             RebuildCanvasTextures();
             _undoHistory.Clear();
             _activeTool = EditorTool.Brush;
@@ -665,8 +826,9 @@ public sealed class PixologyGame : Game
         DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), "Brush", EditorTool.Brush, mouse);
         DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), "Erase", EditorTool.Erase, mouse);
         DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), "Bucket", EditorTool.PaintBucket, mouse);
-        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Crop (C)", EditorTool.Crop, mouse);
+        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Crop", EditorTool.Crop, mouse);
         DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), "Dropper", EditorTool.Eyedropper, mouse);
+        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), "Select", EditorTool.Select, mouse);
 
         var checkbox = new Rectangle(124, 17, 22, 22);
         DrawRectangle(checkbox, Color.White);
@@ -703,8 +865,13 @@ public sealed class PixologyGame : Game
         {
             DrawPixelText("Click a pixel to pick its color", new Vector2(440, 17), Color.Black);
         }
+        else if (_activeTool == EditorTool.Select)
+        {
+            DrawPixelText("Drag selected layer pixels to move", new Vector2(440, 17), Color.Black);
+        }
 
         DrawColorPicker(rightSidebar);
+        DrawLayersPanel(rightSidebar, mouse);
 
         if (_saveMessage.Length > 0)
         {
@@ -726,6 +893,8 @@ public sealed class PixologyGame : Game
             DrawCanvasGrid(canvasBounds);
         if (_activeTool == EditorTool.Crop)
             DrawCropSelection(canvasBounds, mousePosition);
+        else if (_activeTool == EditorTool.Select)
+            DrawLayerSelection(canvasBounds);
         else
             DrawBrushCursor(canvasBounds, mousePosition);
     }
@@ -813,6 +982,31 @@ public sealed class PixologyGame : Game
         DrawPixelText(sizeLabel, labelPosition, Color.Black);
     }
 
+    private void DrawLayerSelection(Rectangle canvasBounds)
+    {
+        if (_selectionBounds.IsEmpty)
+            return;
+
+        var pixelScale = Math.Max(1, canvasBounds.Width / _canvasWidth);
+        var selectionBounds = new Rectangle(
+            canvasBounds.X + _selectionBounds.X * pixelScale,
+            canvasBounds.Y + _selectionBounds.Y * pixelScale,
+            _selectionBounds.Width * pixelScale,
+            _selectionBounds.Height * pixelScale);
+        DrawOutline(selectionBounds, Color.White, 4);
+        if (selectionBounds.Width > 4 && selectionBounds.Height > 4)
+        {
+            DrawOutline(
+                new Rectangle(
+                    selectionBounds.X + 2,
+                    selectionBounds.Y + 2,
+                    selectionBounds.Width - 4,
+                    selectionBounds.Height - 4),
+                Color.Black,
+                1);
+        }
+    }
+
     private void HandleStartScreenClick(Point position)
     {
         var viewport = GraphicsDevice.Viewport;
@@ -824,8 +1018,14 @@ public sealed class PixologyGame : Game
 
         if (firstButton.Contains(position))
         {
-            Array.Clear(_canvasPixels);
-            _canvas.SetData(_canvasPixels);
+            _canvasWidth = InitialCanvasSize;
+            _canvasHeight = InitialCanvasSize;
+            _canvasPixels = new Color[_canvasWidth * _canvasHeight];
+            _layers.Clear();
+            _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
+            _activeLayerIndex = 0;
+            _layerListOffset = 0;
+            RebuildCanvasTextures();
             _showGrid = false;
             _activeTool = EditorTool.Brush;
             _undoHistory.Clear();
@@ -846,16 +1046,119 @@ public sealed class PixologyGame : Game
     {
         _isDrawingStroke = true;
         _strokeChanged = false;
-        _strokeSnapshot = (Color[])_canvasPixels.Clone();
+        _strokeDocumentSnapshot = CaptureActiveLayerSnapshot();
+    }
+
+    private void ActivateSelectionTool()
+    {
+        _activeTool = EditorTool.Select;
+        UpdateSelectionBounds();
+    }
+
+    private void UpdateSelectionBounds()
+    {
+        var left = _canvasWidth;
+        var top = _canvasHeight;
+        var right = -1;
+        var bottom = -1;
+        for (var y = 0; y < _canvasHeight; y++)
+        {
+            for (var x = 0; x < _canvasWidth; x++)
+            {
+                if (_canvasPixels[y * _canvasWidth + x].A == 0)
+                    continue;
+
+                left = Math.Min(left, x);
+                top = Math.Min(top, y);
+                right = Math.Max(right, x);
+                bottom = Math.Max(bottom, y);
+            }
+        }
+
+        _selectionBounds = right < left || bottom < top
+            ? Rectangle.Empty
+            : new Rectangle(left, top, right - left + 1, bottom - top + 1);
+    }
+
+    private void BeginSelectionMove(Point position)
+    {
+        var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
+        if (_selectionBounds.IsEmpty ||
+            !TryGetCanvasPixel(position, canvasBounds, out var pixelX, out var pixelY) ||
+            !_selectionBounds.Contains(pixelX, pixelY))
+        {
+            return;
+        }
+
+        _isMovingSelection = true;
+        _selectionMoveChanged = false;
+        _selectionDragStart = position;
+        _selectionMoveBounds = _selectionBounds;
+        _selectionMoveOffset = Point.Zero;
+        _selectionMoveSnapshot = CaptureActiveLayerSnapshot();
+    }
+
+    private void UpdateSelectionMove(Point position)
+    {
+        var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
+        var pixelScale = Math.Max(1, canvasBounds.Width / _canvasWidth);
+        var offset = new Point(
+            (int)MathF.Round((position.X - _selectionDragStart.X) / (float)pixelScale),
+            (int)MathF.Round((position.Y - _selectionDragStart.Y) / (float)pixelScale));
+        if (offset == _selectionMoveOffset)
+            return;
+
+        _selectionMoveOffset = offset;
+        _selectionMoveChanged = offset.X != 0 || offset.Y != 0;
+        Array.Clear(_canvasPixels);
+
+        var sourcePixels = _selectionMoveSnapshot.ChangedLayerPixels;
+        for (var y = _selectionMoveBounds.Top; y < _selectionMoveBounds.Bottom; y++)
+        {
+            var destinationY = y + offset.Y;
+            if (destinationY < 0 || destinationY >= _canvasHeight)
+                continue;
+
+            for (var x = _selectionMoveBounds.Left; x < _selectionMoveBounds.Right; x++)
+            {
+                var destinationX = x + offset.X;
+                if (destinationX < 0 || destinationX >= _canvasWidth)
+                    continue;
+
+                _canvasPixels[destinationY * _canvasWidth + destinationX] =
+                    sourcePixels[y * _canvasWidth + x];
+            }
+        }
+
+        var movedBounds = new Rectangle(
+            _selectionMoveBounds.X + offset.X,
+            _selectionMoveBounds.Y + offset.Y,
+            _selectionMoveBounds.Width,
+            _selectionMoveBounds.Height);
+        _selectionBounds = Rectangle.Intersect(
+            new Rectangle(0, 0, _canvasWidth, _canvasHeight),
+            movedBounds);
+        RefreshCompositeTexture();
+    }
+
+    private void FinishSelectionMove()
+    {
+        _isMovingSelection = false;
+        if (_selectionMoveChanged)
+            _undoHistory.Push(_selectionMoveSnapshot);
+
+        _selectionMoveSnapshot = null!;
+        _selectionMoveChanged = false;
+        UpdateSelectionBounds();
     }
 
     private void FinishStroke()
     {
         _isDrawingStroke = false;
         if (_strokeChanged)
-            _undoHistory.Push(new CanvasSnapshot(_canvasWidth, _canvasHeight, _strokeSnapshot));
+            _undoHistory.Push(_strokeDocumentSnapshot);
 
-        _strokeSnapshot = Array.Empty<Color>();
+        _strokeDocumentSnapshot = null!;
         _strokeChanged = false;
     }
 
@@ -864,10 +1167,60 @@ public sealed class PixologyGame : Game
         if (_undoHistory.Count == 0)
             return;
 
-        var snapshot = _undoHistory.Pop();
+        RestoreDocumentSnapshot(_undoHistory.Pop());
+    }
+
+    private CanvasSnapshot CaptureDocumentSnapshot()
+    {
+        return new CanvasSnapshot(
+            _canvasWidth,
+            _canvasHeight,
+            _layers.Select(layer => new LayerSnapshot(
+                layer.Name,
+                layer.Opacity,
+                (Color[])layer.Pixels.Clone())).ToArray(),
+            _activeLayerIndex,
+            -1,
+            Array.Empty<Color>());
+    }
+
+    private CanvasSnapshot CaptureActiveLayerSnapshot()
+    {
+        return new CanvasSnapshot(
+            _canvasWidth,
+            _canvasHeight,
+            Array.Empty<LayerSnapshot>(),
+            _activeLayerIndex,
+            _activeLayerIndex,
+            (Color[])_canvasPixels.Clone());
+    }
+
+    private void RestoreDocumentSnapshot(CanvasSnapshot snapshot)
+    {
+        if (snapshot.ChangedLayerIndex >= 0)
+        {
+            _layers[snapshot.ChangedLayerIndex].Pixels = snapshot.ChangedLayerPixels;
+            _activeLayerIndex = snapshot.ChangedLayerIndex;
+            _canvasPixels = _layers[_activeLayerIndex].Pixels;
+            if (_activeTool == EditorTool.Select)
+                UpdateSelectionBounds();
+            RefreshCompositeTexture();
+            return;
+        }
+
         _canvasWidth = snapshot.Width;
         _canvasHeight = snapshot.Height;
-        _canvasPixels = snapshot.Pixels;
+        _layers.Clear();
+        _layers.AddRange(snapshot.Layers.Select(layer => new Layer
+        {
+            Name = layer.Name,
+            Opacity = layer.Opacity,
+            Pixels = layer.Pixels
+        }));
+        _activeLayerIndex = Math.Clamp(snapshot.ActiveLayerIndex, 0, _layers.Count - 1);
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
+        if (_activeTool == EditorTool.Select)
+            UpdateSelectionBounds();
         RebuildCanvasTextures();
     }
 
@@ -1001,25 +1354,34 @@ public sealed class PixologyGame : Game
              _cropSelection.Width == _canvasWidth && _cropSelection.Height == _canvasHeight))
             return;
 
-        var resizedPixels = new Color[_cropSelection.Width * _cropSelection.Height];
-        for (var y = 0; y < _cropSelection.Height; y++)
+        var snapshot = CaptureDocumentSnapshot();
+        var resizedLayers = new List<Layer>(_layers.Count);
+        foreach (var layer in _layers)
         {
-            var sourceY = _cropSelection.Y + y;
-            if (sourceY < 0 || sourceY >= _canvasHeight)
-                continue;
-
-            for (var x = 0; x < _cropSelection.Width; x++)
+            var resizedPixels = new Color[_cropSelection.Width * _cropSelection.Height];
+            for (var y = 0; y < _cropSelection.Height; y++)
             {
-                var sourceX = _cropSelection.X + x;
-                if (sourceX >= 0 && sourceX < _canvasWidth)
-                    resizedPixels[y * _cropSelection.Width + x] = _canvasPixels[sourceY * _canvasWidth + sourceX];
+                var sourceY = _cropSelection.Y + y;
+                if (sourceY < 0 || sourceY >= _canvasHeight)
+                    continue;
+
+                for (var x = 0; x < _cropSelection.Width; x++)
+                {
+                    var sourceX = _cropSelection.X + x;
+                    if (sourceX >= 0 && sourceX < _canvasWidth)
+                        resizedPixels[y * _cropSelection.Width + x] = layer.Pixels[sourceY * _canvasWidth + sourceX];
+                }
             }
+
+            resizedLayers.Add(new Layer { Name = layer.Name, Opacity = layer.Opacity, Pixels = resizedPixels });
         }
 
-        _undoHistory.Push(new CanvasSnapshot(_canvasWidth, _canvasHeight, (Color[])_canvasPixels.Clone()));
+        _undoHistory.Push(snapshot);
         _canvasWidth = _cropSelection.Width;
         _canvasHeight = _cropSelection.Height;
-        _canvasPixels = resizedPixels;
+        _layers.Clear();
+        _layers.AddRange(resizedLayers);
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
         RebuildCanvasTextures();
         _cropSelection = new Rectangle(0, 0, _canvasWidth, _canvasHeight);
     }
@@ -1038,7 +1400,7 @@ public sealed class PixologyGame : Game
         if (!TryGetCanvasPixel(position, canvasBounds, out var pixelX, out var pixelY))
             return;
 
-        _selectedColor = _canvasPixels[pixelY * _canvasWidth + pixelX];
+        _selectedColor = _compositePixels[pixelY * _canvasWidth + pixelX];
         UpdateHsvFromSelectedColor();
     }
 
@@ -1047,7 +1409,6 @@ public sealed class PixologyGame : Game
         _canvas?.Dispose();
         _checkerboard?.Dispose();
         _canvas = new Texture2D(GraphicsDevice, _canvasWidth, _canvasHeight);
-        _canvas.SetData(_canvasPixels);
         _checkerboard = new Texture2D(GraphicsDevice, _canvasWidth, _canvasHeight);
 
         var checkerboardPixels = new Color[_canvasWidth * _canvasHeight];
@@ -1063,6 +1424,37 @@ public sealed class PixologyGame : Game
         }
 
         _checkerboard.SetData(checkerboardPixels);
+        RefreshCompositeTexture();
+    }
+
+    private void RefreshCompositeTexture()
+    {
+        _compositePixels = new Color[_canvasWidth * _canvasHeight];
+        foreach (var layer in _layers)
+        {
+            for (var index = 0; index < _compositePixels.Length; index++)
+                _compositePixels[index] = CompositeOver(_compositePixels[index], layer.Pixels[index], layer.Opacity);
+        }
+
+        _canvas.SetData(_compositePixels);
+    }
+
+    private static Color CompositeOver(Color destination, Color source, float opacity)
+    {
+        var sourceAlpha = source.A / 255f * opacity;
+        var destinationAlpha = destination.A / 255f;
+        var outputAlpha = sourceAlpha + destinationAlpha * (1f - sourceAlpha);
+        if (outputAlpha <= 0f)
+            return Color.Transparent;
+
+        var red = (source.R * sourceAlpha + destination.R * destinationAlpha * (1f - sourceAlpha)) / outputAlpha;
+        var green = (source.G * sourceAlpha + destination.G * destinationAlpha * (1f - sourceAlpha)) / outputAlpha;
+        var blue = (source.B * sourceAlpha + destination.B * destinationAlpha * (1f - sourceAlpha)) / outputAlpha;
+        return new Color(
+            (byte)Math.Clamp(MathF.Round(red), 0f, 255f),
+            (byte)Math.Clamp(MathF.Round(green), 0f, 255f),
+            (byte)Math.Clamp(MathF.Round(blue), 0f, 255f),
+            (byte)Math.Clamp(MathF.Round(outputAlpha * 255f), 0f, 255f));
     }
 
     private void DrawOnCanvas(Point start, Point end)
@@ -1101,7 +1493,7 @@ public sealed class PixologyGame : Game
 
         if (changed)
         {
-            _canvas.SetData(_canvasPixels);
+            RefreshCompositeTexture();
             _strokeChanged = true;
         }
     }
@@ -1230,6 +1622,9 @@ public sealed class PixologyGame : Game
             return;
         }
 
+        if (HandleLayerPanelClick(position))
+            return;
+
         if (new Rectangle(8, 72, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.Brush;
@@ -1257,6 +1652,12 @@ public sealed class PixologyGame : Game
         if (new Rectangle(8, 328, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.Eyedropper;
+            return;
+        }
+
+        if (new Rectangle(8, 392, SidebarWidth - 16, 56).Contains(position))
+        {
+            ActivateSelectionTool();
             return;
         }
 
@@ -1464,6 +1865,7 @@ public sealed class PixologyGame : Game
         var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         var filePath = Path.Combine(desktopPath, "image.png");
         using var stream = File.Create(filePath);
+        RefreshCompositeTexture();
         _canvas.SaveAsPng(stream, _canvasWidth, _canvasHeight);
         _saveMessage = "Saved image.png to Desktop";
     }
@@ -1541,6 +1943,350 @@ public sealed class PixologyGame : Game
         DrawRectangle(bounds.HexBounds, _hexSelected ? new Color(50, 100, 170) : Color.White);
         DrawOutline(bounds.HexBounds, Color.Black, 1);
         DrawPixelText(hexColor, bounds.HexPosition, _hexSelected ? Color.White : Color.Black);
+    }
+
+    private void DrawLayersPanel(Rectangle sidebar, MouseState mouse)
+    {
+        var bounds = GetLayersPanelBounds(sidebar);
+        DrawRectangle(new Rectangle(bounds.X, bounds.Y, bounds.Width, 1), new Color(210, 210, 210));
+        DrawPixelText("Layers", new Vector2(bounds.X + 12, bounds.Y + 8), Color.Black);
+
+        var opacityBounds = GetLayerOpacityBounds(bounds);
+        DrawPixelText("Opacity", new Vector2(bounds.X + 12, opacityBounds.Y - 19), Color.Black);
+        DrawRectangle(opacityBounds, Color.White);
+        DrawOutline(opacityBounds, Color.Black, 1);
+        var markerX = opacityBounds.X + (int)MathF.Round(_layers[_activeLayerIndex].Opacity * (opacityBounds.Width - 1));
+        DrawRectangle(new Rectangle(opacityBounds.X, opacityBounds.Y + 1, markerX - opacityBounds.X, opacityBounds.Height - 2), new Color(155, 190, 230));
+        DrawRectangle(new Rectangle(markerX - 2, opacityBounds.Y - 2, 4, opacityBounds.Height + 4), Color.Black);
+        DrawPixelText($"{(int)MathF.Round(_layers[_activeLayerIndex].Opacity * 100)}%", new Vector2(opacityBounds.Right + 6, opacityBounds.Y - 2), Color.Black);
+
+        var listBounds = GetLayerListBounds(bounds);
+        DrawRectangle(listBounds, Color.White);
+        DrawOutline(listBounds, Color.Black, 1);
+        const int rowHeight = 36;
+        var visibleRows = Math.Max(0, listBounds.Height / rowHeight);
+        for (var row = 0; row < visibleRows; row++)
+        {
+            var layerIndex = _layers.Count - 1 - _layerListOffset - row;
+            if (layerIndex < 0)
+                break;
+
+            var rowBounds = new Rectangle(listBounds.X + 1, listBounds.Y + 1 + row * rowHeight, listBounds.Width - 2, rowHeight);
+            if (layerIndex == _activeLayerIndex)
+                DrawRectangle(rowBounds, new Color(190, 215, 245));
+            else if (_isDraggingLayer && layerIndex == _layerDropTargetIndex)
+                DrawRectangle(rowBounds, new Color(220, 232, 248));
+
+            DrawPixelText(
+                FitText(_layers[layerIndex].Name, rowBounds.Width - 12),
+                new Vector2(rowBounds.X + 6, rowBounds.Y + 9),
+                Color.Black);
+        }
+
+        if (_isDraggingLayer && _layerDropTargetIndex >= 0)
+        {
+            var targetRow = _layerDropTargetIndex;
+            var targetY = listBounds.Y + 1 + (_layers.Count - 1 - _layerListOffset - targetRow) * rowHeight;
+            DrawRectangle(
+                new Rectangle(listBounds.X + 1, targetY, listBounds.Width - 2, 2),
+                new Color(30, 90, 180));
+        }
+
+        DrawButton(GetAddLayerButtonBounds(bounds), "Add", mouse);
+        if (_isLayerContextMenuOpen)
+            DrawLayerContextMenu(mouse);
+    }
+
+    private static Rectangle GetLayersPanelBounds(Rectangle sidebar)
+    {
+        return new Rectangle(sidebar.X, sidebar.Y + 220, sidebar.Width, Math.Max(0, sidebar.Height - 220));
+    }
+
+    private static Rectangle GetAddLayerButtonBounds(Rectangle panel)
+    {
+        return new Rectangle(panel.X + 12, panel.Bottom - 42, panel.Width - 24, 32);
+    }
+
+    private static Rectangle GetLayerOpacityBounds(Rectangle panel)
+    {
+        return new Rectangle(panel.X + 12, panel.Y + 50, Math.Max(40, panel.Width - 76), 18);
+    }
+
+    private static Rectangle GetLayerListBounds(Rectangle panel)
+    {
+        var top = panel.Y + 88;
+        return new Rectangle(
+            panel.X + 12,
+            top,
+            panel.Width - 24,
+            Math.Max(0, GetAddLayerButtonBounds(panel).Y - top - 8));
+    }
+
+    private static Rectangle GetLayerContextMenuBounds(Point position)
+    {
+        return new Rectangle(position.X, position.Y, 140, 84);
+    }
+
+    private bool HandleLayerPanelClick(Point position)
+    {
+        var panel = GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport));
+        if (_isLayerContextMenuOpen)
+        {
+            var menu = GetLayerContextMenuBounds(_layerContextMenuPosition);
+            if (menu.Contains(position))
+            {
+                var action = (position.Y - menu.Y) / 28;
+                var layerIndex = _contextMenuLayerIndex;
+                _isLayerContextMenuOpen = false;
+                if (action == 0)
+                    MergeLayer(layerIndex, 1);
+                else if (action == 1)
+                    MergeLayer(layerIndex, -1);
+                else if (action == 2)
+                    DeleteLayer(layerIndex);
+
+                return true;
+            }
+
+            _isLayerContextMenuOpen = false;
+        }
+
+        var addButton = GetAddLayerButtonBounds(panel);
+        if (addButton.Contains(position))
+        {
+            AddLayer();
+            return true;
+        }
+
+        var opacityBounds = GetLayerOpacityBounds(panel);
+        if (opacityBounds.Contains(position))
+        {
+            _opacityDocumentSnapshot = CaptureDocumentSnapshot();
+            _layerOpacityChanged = false;
+            _isAdjustingLayerOpacity = true;
+            UpdateLayerOpacity(position);
+            return true;
+        }
+
+        var listBounds = GetLayerListBounds(panel);
+        if (listBounds.Contains(position))
+        {
+            var row = (position.Y - listBounds.Y - 1) / 36;
+            var layerIndex = _layers.Count - 1 - _layerListOffset - row;
+            if (row >= 0 && layerIndex >= 0 && layerIndex < _layers.Count)
+            {
+                SelectLayer(layerIndex);
+                _isDraggingLayer = true;
+                _draggedLayerIndex = layerIndex;
+                _layerDropTargetIndex = layerIndex;
+                _layerDragStartPosition = position;
+                _layerDragMoved = false;
+            }
+
+            return true;
+        }
+
+        return panel.Contains(position);
+    }
+
+    private void HandleLayerPanelRightClick(Point position)
+    {
+        var panel = GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport));
+        var listBounds = GetLayerListBounds(panel);
+        if (!listBounds.Contains(position))
+        {
+            _isLayerContextMenuOpen = false;
+            return;
+        }
+
+        var row = (position.Y - listBounds.Y - 1) / 36;
+        var layerIndex = _layers.Count - 1 - _layerListOffset - row;
+        if (row < 0 || layerIndex < 0 || layerIndex >= _layers.Count)
+        {
+            _isLayerContextMenuOpen = false;
+            return;
+        }
+
+        SelectLayer(layerIndex);
+        var menuWidth = 140;
+        var menuHeight = 84;
+        _layerContextMenuPosition = new Point(
+            Math.Clamp(position.X, panel.X, Math.Max(panel.X, panel.Right - menuWidth)),
+            Math.Clamp(position.Y, panel.Y, Math.Max(panel.Y, panel.Bottom - menuHeight)));
+        _contextMenuLayerIndex = layerIndex;
+        _isLayerContextMenuOpen = true;
+        _isDraggingLayer = false;
+    }
+
+    private void DrawLayerContextMenu(MouseState mouse)
+    {
+        var menu = GetLayerContextMenuBounds(_layerContextMenuPosition);
+        DrawRectangle(menu, Color.White);
+        DrawOutline(menu, Color.Black, 1);
+        var layerIndex = _contextMenuLayerIndex;
+        var canMergeUp = layerIndex >= 0 && layerIndex < _layers.Count - 1;
+        var canMergeDown = layerIndex > 0 && layerIndex < _layers.Count;
+        var canDelete = _layers.Count > 1;
+        DrawLayerContextMenuItem(menu, 0, "Merge Up", canMergeUp, mouse);
+        DrawLayerContextMenuItem(menu, 1, "Merge Down", canMergeDown, mouse);
+        DrawLayerContextMenuItem(menu, 2, "Delete", canDelete, mouse);
+    }
+
+    private void DrawLayerContextMenuItem(Rectangle menu, int item, string label, bool enabled, MouseState mouse)
+    {
+        var bounds = new Rectangle(menu.X + 1, menu.Y + 1 + item * 27, menu.Width - 2, 27);
+        if (enabled && bounds.Contains(mouse.Position))
+            DrawRectangle(bounds, new Color(220, 232, 248));
+
+        DrawPixelText(
+            label,
+            new Vector2(bounds.X + 8, bounds.Y + 6),
+            enabled ? Color.Black : new Color(145, 145, 145));
+    }
+
+    private void SelectLayer(int layerIndex)
+    {
+        _activeLayerIndex = layerIndex;
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
+        if (_activeTool == EditorTool.Select)
+            UpdateSelectionBounds();
+    }
+
+    private void UpdateLayerDrag(Point position)
+    {
+        var dragX = position.X - _layerDragStartPosition.X;
+        var dragY = position.Y - _layerDragStartPosition.Y;
+        if (dragX * dragX + dragY * dragY >= 16)
+            _layerDragMoved = true;
+
+        var listBounds = GetLayerListBounds(GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport)));
+        if (!listBounds.Contains(position))
+            return;
+
+        var row = (position.Y - listBounds.Y - 1) / 36;
+        var layerIndex = _layers.Count - 1 - _layerListOffset - row;
+        if (row >= 0 && layerIndex >= 0 && layerIndex < _layers.Count)
+            _layerDropTargetIndex = layerIndex;
+    }
+
+    private void FinishLayerDrag()
+    {
+        if (_layerDragMoved && _layerDropTargetIndex >= 0)
+            ReorderLayer(_draggedLayerIndex, _layerDropTargetIndex);
+
+        _isDraggingLayer = false;
+        _draggedLayerIndex = -1;
+        _layerDropTargetIndex = -1;
+        _layerDragMoved = false;
+    }
+
+    private void ReorderLayer(int sourceIndex, int destinationIndex)
+    {
+        if (sourceIndex < 0 || sourceIndex >= _layers.Count ||
+            destinationIndex < 0 || destinationIndex >= _layers.Count ||
+            sourceIndex == destinationIndex)
+        {
+            return;
+        }
+
+        _undoHistory.Push(CaptureDocumentSnapshot());
+        var activeLayer = _layers[_activeLayerIndex];
+        var layer = _layers[sourceIndex];
+        _layers.RemoveAt(sourceIndex);
+        _layers.Insert(destinationIndex, layer);
+        _activeLayerIndex = _layers.IndexOf(activeLayer);
+        SetLayerListOffset(_layerListOffset);
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
+        RefreshCompositeTexture();
+    }
+
+    private void SetLayerListOffset(int offset)
+    {
+        var panel = GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport));
+        var visibleRows = Math.Max(1, GetLayerListBounds(panel).Height / 36);
+        _layerListOffset = Math.Clamp(offset, 0, Math.Max(0, _layers.Count - visibleRows));
+    }
+
+    private void UpdateLayerOpacity(Point position)
+    {
+        var bounds = GetLayerOpacityBounds(GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport)));
+        var opacity = Math.Clamp((position.X - bounds.X) / (float)(bounds.Width - 1), 0f, 1f);
+        if (MathF.Abs(_layers[_activeLayerIndex].Opacity - opacity) < 0.001f)
+            return;
+
+        _layers[_activeLayerIndex].Opacity = opacity;
+        _layerOpacityChanged = true;
+        RefreshCompositeTexture();
+    }
+
+    private void AddLayer()
+    {
+        _undoHistory.Push(CaptureDocumentSnapshot());
+        var layer = new Layer
+        {
+            Name = $"Layer {_layers.Count + 1}",
+            Pixels = new Color[_canvasWidth * _canvasHeight]
+        };
+        _layers.Insert(_activeLayerIndex + 1, layer);
+        _activeLayerIndex++;
+        _layerListOffset = 0;
+        _canvasPixels = layer.Pixels;
+        if (_activeTool == EditorTool.Select)
+            UpdateSelectionBounds();
+        RefreshCompositeTexture();
+    }
+
+    private void MergeLayer(int layerIndex, int direction)
+    {
+        var neighborIndex = layerIndex + direction;
+        if (layerIndex < 0 || layerIndex >= _layers.Count ||
+            neighborIndex < 0 || neighborIndex >= _layers.Count)
+            return;
+
+        _undoHistory.Push(CaptureDocumentSnapshot());
+        var lowerIndex = Math.Min(layerIndex, neighborIndex);
+        var upperIndex = lowerIndex + 1;
+        var lower = _layers[lowerIndex];
+        var upper = _layers[upperIndex];
+        var mergedPixels = new Color[_canvasWidth * _canvasHeight];
+        for (var index = 0; index < mergedPixels.Length; index++)
+        {
+            var lowerColor = CompositeOver(Color.Transparent, lower.Pixels[index], lower.Opacity);
+            mergedPixels[index] = CompositeOver(lowerColor, upper.Pixels[index], upper.Opacity);
+        }
+
+        var merged = new Layer
+        {
+            Name = $"{lower.Name} + {upper.Name}",
+            Pixels = mergedPixels
+        };
+        _layers.RemoveAt(upperIndex);
+        _layers[lowerIndex] = merged;
+        _activeLayerIndex = lowerIndex;
+        SetLayerListOffset(_layerListOffset);
+        _canvasPixels = merged.Pixels;
+        if (_activeTool == EditorTool.Select)
+            UpdateSelectionBounds();
+        RefreshCompositeTexture();
+    }
+
+    private void DeleteLayer(int layerIndex)
+    {
+        if (_layers.Count <= 1 || layerIndex < 0 || layerIndex >= _layers.Count)
+            return;
+
+        _undoHistory.Push(CaptureDocumentSnapshot());
+        _layers.RemoveAt(layerIndex);
+        if (_activeLayerIndex > layerIndex)
+            _activeLayerIndex--;
+        else if (_activeLayerIndex == layerIndex)
+            _activeLayerIndex = Math.Min(layerIndex, _layers.Count - 1);
+
+        SetLayerListOffset(_layerListOffset);
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
+        if (_activeTool == EditorTool.Select)
+            UpdateSelectionBounds();
+        RefreshCompositeTexture();
     }
 
     private void UpdateColorPicker(Point position)
