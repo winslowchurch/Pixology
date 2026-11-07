@@ -11,6 +11,7 @@ internal sealed class MacTrackpadPinch : IDisposable
     private const int GestureEnded = 3;
     private const int GestureCancelled = 4;
     private const int GestureFailed = 5;
+    private static readonly nint FloatingWindowLevel = 3;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void GestureAction(IntPtr target, IntPtr selector, IntPtr recognizer);
@@ -39,6 +40,7 @@ internal sealed class MacTrackpadPinch : IDisposable
     private static MacTrackpadPinch s_active = null!;
 
     private readonly Action<float> _onMagnification;
+    private IntPtr _window;
     private IntPtr _view;
     private IntPtr _recognizer;
     private IntPtr _target;
@@ -60,6 +62,12 @@ internal sealed class MacTrackpadPinch : IDisposable
         var applicationClass = objc_getClass("NSApplication");
         var application = SendIntPtr(applicationClass, Selector("sharedApplication"));
         var window = SendIntPtr(application, Selector("keyWindow"));
+        if (window != IntPtr.Zero && window != _window)
+        {
+            SendVoidNInt(window, Selector("setLevel:"), FloatingWindowLevel);
+            _window = window;
+        }
+
         var view = SendIntPtr(window, Selector("contentView"));
         if (view == IntPtr.Zero || view == _view)
             return;
@@ -195,6 +203,9 @@ internal sealed class MacTrackpadPinch : IDisposable
 
     [DllImport(ObjectiveCRuntime, EntryPoint = "objc_msgSend")]
     private static extern void SendVoid(IntPtr receiver, IntPtr selector);
+
+    [DllImport(ObjectiveCRuntime, EntryPoint = "objc_msgSend")]
+    private static extern void SendVoidNInt(IntPtr receiver, IntPtr selector, nint argument);
 
     [DllImport(ObjectiveCRuntime, EntryPoint = "objc_msgSend")]
     private static extern double SendDouble(IntPtr receiver, IntPtr selector);
