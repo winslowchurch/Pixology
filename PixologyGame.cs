@@ -71,7 +71,8 @@ public sealed class PixologyGame : Game
         LayerSnapshot[] Layers,
         int ActiveLayerIndex,
         int ChangedLayerIndex,
-        Color[] ChangedLayerPixels);
+        Color[] ChangedLayerPixels,
+        Rectangle SelectionBounds);
     private sealed record OpenFileEntry(string Name, string Path, bool IsDirectory);
 
     private enum ColorPickerDrag
@@ -126,8 +127,10 @@ public sealed class PixologyGame : Game
     private Rectangle _cropDragSelection;
     private CropDragMode _cropDragMode;
     private bool _isMovingSelection;
+    private bool _isCreatingSelection;
     private bool _selectionMoveChanged;
     private Point _selectionDragStart;
+    private Point _selectionBoxStart;
     private Rectangle _selectionMoveBounds;
     private Point _selectionMoveOffset;
     private Rectangle _selectionBounds;
@@ -310,7 +313,9 @@ public sealed class PixologyGame : Game
             else if (_activeTool == EditorTool.Eyedropper)
                 SampleCanvasColor(mouse.Position);
             else if (_activeTool == EditorTool.Select)
-                BeginSelectionMove(mouse.Position);
+                BeginSelectionInteraction(
+                    mouse.Position,
+                    keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift));
             else if (_activeTool != EditorTool.Crop && IsInsideCanvas(mouse.Position))
                 BeginStroke();
         }
@@ -337,6 +342,8 @@ public sealed class PixologyGame : Game
             UpdateCrop(mouse.Position);
         if (_isMovingSelection && leftPressed)
             UpdateSelectionMove(mouse.Position);
+        if (_isCreatingSelection && leftPressed)
+            UpdateSelectionBox(mouse.Position);
         if (_isDraggingLayer && leftPressed)
             UpdateLayerDrag(mouse.Position);
 
@@ -351,6 +358,8 @@ public sealed class PixologyGame : Game
             FinishCrop();
         if (_isMovingSelection && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
             FinishSelectionMove();
+        if (_isCreatingSelection && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
+            _isCreatingSelection = false;
         if (_isDraggingLayer && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
             FinishLayerDrag();
 
@@ -1040,13 +1049,17 @@ public sealed class PixologyGame : Game
             : new Rectangle(left, top, right - left + 1, bottom - top + 1);
     }
 
-    private void BeginSelectionMove(Point position)
+    private void BeginSelectionInteraction(Point position, bool forceNewSelection)
     {
         var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
-        if (_selectionBounds.IsEmpty ||
-            !TryGetCanvasPixel(position, canvasBounds, out var pixelX, out var pixelY) ||
-            !_selectionBounds.Contains(pixelX, pixelY))
+        if (!TryGetCanvasPixel(position, canvasBounds, out var pixelX, out var pixelY))
+            return;
+
+        if (forceNewSelection || _selectionBounds.IsEmpty || !_selectionBounds.Contains(pixelX, pixelY))
         {
+            _isCreatingSelection = true;
+            _selectionBoxStart = new Point(pixelX, pixelY);
+            _selectionBounds = new Rectangle(pixelX, pixelY, 1, 1);
             return;
         }
 
@@ -1056,6 +1069,28 @@ public sealed class PixologyGame : Game
         _selectionMoveBounds = _selectionBounds;
         _selectionMoveOffset = Point.Zero;
         _selectionMoveSnapshot = CaptureActiveLayerSnapshot();
+    }
+
+    private void UpdateSelectionBox(Point position)
+    {
+        var startPosition = GetCanvasBounds(GraphicsDevice.Viewport);
+        var startPoint = _selectionBoxStart;
+        var currentPoint = GetCanvasPixelClamped(position, startPosition);
+        _selectionBounds = new Rectangle(
+            Math.Min(startPoint.X, currentPoint.X),
+            Math.Min(startPoint.Y, currentPoint.Y),
+            Math.Abs(startPoint.X - currentPoint.X) + 1,
+            Math.Abs(startPoint.Y - currentPoint.Y) + 1);
+    }
+
+    private Point GetCanvasPixelClamped(Point position, Rectangle canvasBounds)
+    {
+        var workspace = GetWorkspaceBounds(GraphicsDevice.Viewport);
+        position.X = Math.Clamp(position.X, Math.Max(workspace.Left, canvasBounds.Left), Math.Min(workspace.Right - 1, canvasBounds.Right - 1));
+        position.Y = Math.Clamp(position.Y, Math.Max(workspace.Top, canvasBounds.Top), Math.Min(workspace.Bottom - 1, canvasBounds.Bottom - 1));
+        return new Point(
+            (position.X - canvasBounds.X) * _canvasWidth / canvasBounds.Width,
+            (position.Y - canvasBounds.Y) * _canvasHeight / canvasBounds.Height);
     }
 
     private void UpdateSelectionMove(Point position)
@@ -1070,9 +1105,14 @@ public sealed class PixologyGame : Game
 
         _selectionMoveOffset = offset;
         _selectionMoveChanged = offset.X != 0 || offset.Y != 0;
-        Array.Clear(_canvasPixels);
-
         var sourcePixels = _selectionMoveSnapshot.ChangedLayerPixels;
+        Array.Copy(sourcePixels, _canvasPixels, sourcePixels.Length);
+        for (var y = Math.Max(0, _selectionMoveBounds.Top); y < Math.Min(_canvasHeight, _selectionMoveBounds.Bottom); y++)
+        {
+            Array.Clear(_canvasPixels, y * _canvasWidth + Math.Max(0, _selectionMoveBounds.Left),
+                Math.Max(0, Math.Min(_canvasWidth, _selectionMoveBounds.Right) - Math.Max(0, _selectionMoveBounds.Left)));
+        }
+
         for (var y = _selectionMoveBounds.Top; y < _selectionMoveBounds.Bottom; y++)
         {
             var destinationY = y + offset.Y;
@@ -1109,7 +1149,6 @@ public sealed class PixologyGame : Game
 
         _selectionMoveSnapshot = null!;
         _selectionMoveChanged = false;
-        UpdateSelectionBounds();
     }
 
     private void FinishStroke()
@@ -1141,7 +1180,8 @@ public sealed class PixologyGame : Game
                 (Color[])layer.Pixels.Clone())).ToArray(),
             _activeLayerIndex,
             -1,
-            Array.Empty<Color>());
+            Array.Empty<Color>(),
+            _selectionBounds);
     }
 
     private CanvasSnapshot CaptureActiveLayerSnapshot()
@@ -1152,7 +1192,8 @@ public sealed class PixologyGame : Game
             Array.Empty<LayerSnapshot>(),
             _activeLayerIndex,
             _activeLayerIndex,
-            (Color[])_canvasPixels.Clone());
+            (Color[])_canvasPixels.Clone(),
+            _selectionBounds);
     }
 
     private void RestoreDocumentSnapshot(CanvasSnapshot snapshot)
@@ -1163,7 +1204,7 @@ public sealed class PixologyGame : Game
             _activeLayerIndex = snapshot.ChangedLayerIndex;
             _canvasPixels = _layers[_activeLayerIndex].Pixels;
             if (_activeTool == EditorTool.Select)
-                UpdateSelectionBounds();
+                _selectionBounds = snapshot.SelectionBounds;
             RefreshCompositeTexture();
             return;
         }
@@ -1180,7 +1221,7 @@ public sealed class PixologyGame : Game
         _activeLayerIndex = Math.Clamp(snapshot.ActiveLayerIndex, 0, _layers.Count - 1);
         _canvasPixels = _layers[_activeLayerIndex].Pixels;
         if (_activeTool == EditorTool.Select)
-            UpdateSelectionBounds();
+            _selectionBounds = snapshot.SelectionBounds;
         RebuildCanvasTextures();
     }
 
