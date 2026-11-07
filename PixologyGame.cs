@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -12,10 +14,13 @@ public sealed class PixologyGame : Game
     private const int ButtonWidth = 220;
     private const int ButtonHeight = 64;
     private const int ButtonGap = 24;
-    private const int CanvasSize = 32;
+    private const int InitialCanvasSize = 32;
+    private const int CropSnapSize = 16;
     private const int ToolbarHeight = 56;
     private const int SidebarWidth = 104;
     private const int RightSidebarWidth = 224;
+    private const float StartScreenTextScale = 3f;
+    private const float StartScreenButtonTextScale = 2f;
     private const float MinimumZoom = 0.25f;
     private const float MaximumZoom = 8f;
 
@@ -23,8 +28,26 @@ public sealed class PixologyGame : Game
     {
         Brush,
         Erase,
-        PaintBucket
+        PaintBucket,
+        Crop,
+        Eyedropper
     }
+
+    private enum CropDragMode
+    {
+        None,
+        Move,
+        Left,
+        Right,
+        Top,
+        Bottom,
+        TopLeft,
+        TopRight,
+        BottomLeft,
+        BottomRight
+    }
+
+    private sealed record CanvasSnapshot(int Width, int Height, Color[] Pixels);
 
     private enum ColorPickerDrag
     {
@@ -34,7 +57,7 @@ public sealed class PixologyGame : Game
     }
 
     private readonly GraphicsDeviceManager _graphics;
-    private readonly Stack<Color[]> _undoHistory = new();
+    private readonly Stack<CanvasSnapshot> _undoHistory = new();
     private SpriteBatch _spriteBatch = null!;
     private SpriteFont _font = null!;
     private SpriteFont _titleFont = null!;
@@ -45,12 +68,17 @@ public sealed class PixologyGame : Game
     private Texture2D _hueTexture = null!;
     private RasterizerState _canvasRasterizer = null!;
     private Color[] _canvasPixels = null!;
+    private int _canvasWidth = InitialCanvasSize;
+    private int _canvasHeight = InitialCanvasSize;
     private bool _isEditing;
     private bool _showGrid;
     private bool _bucketContiguous = true;
     private bool _isDrawingStroke;
     private bool _strokeChanged;
     private bool _isPanning;
+    private bool _isCropping;
+    private bool _cropSelectionInitialized;
+    private bool _hexSelected;
     private EditorTool _activeTool;
     private ColorPickerDrag _colorPickerDrag;
     private float _selectedHue;
@@ -58,6 +86,10 @@ public sealed class PixologyGame : Game
     private float _selectedValue = 1f;
     private Color _selectedColor = Color.Red;
     private Color[] _strokeSnapshot = Array.Empty<Color>();
+    private Point _cropDragStart;
+    private Rectangle _cropSelection;
+    private Rectangle _cropDragSelection;
+    private CropDragMode _cropDragMode;
     private Vector2 _canvasPan;
     private float _zoom = 1f;
     private MacTrackpadPinch _trackpadPinch = null!;
@@ -84,27 +116,13 @@ public sealed class PixologyGame : Game
         _spriteBatch = new SpriteBatch(GraphicsDevice);
         _font = Content.Load<SpriteFont>("PixelFont");
         _titleFont = Content.Load<SpriteFont>("PixelFontTitle");
+        MakeFontPixelPerfect(_font);
+        MakeFontPixelPerfect(_titleFont);
         _canvasRasterizer = new RasterizerState { ScissorTestEnable = true };
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
-        _canvasPixels = new Color[CanvasSize * CanvasSize];
-        _canvas = new Texture2D(GraphicsDevice, CanvasSize, CanvasSize);
-        _canvas.SetData(_canvasPixels);
-        _checkerboard = new Texture2D(GraphicsDevice, CanvasSize, CanvasSize);
-
-        var checkerboardPixels = new Color[CanvasSize * CanvasSize];
-        for (var y = 0; y < CanvasSize; y++)
-        {
-            for (var x = 0; x < CanvasSize; x++)
-            {
-                var isLight = ((x / 8) + (y / 8)) % 2 == 0;
-                checkerboardPixels[y * CanvasSize + x] = isLight
-                    ? new Color(238, 238, 238)
-                    : Color.White;
-            }
-        }
-
-        _checkerboard.SetData(checkerboardPixels);
+        _canvasPixels = new Color[_canvasWidth * _canvasHeight];
+        RebuildCanvasTextures();
         _saturationValueTexture = new Texture2D(GraphicsDevice, 144, 144);
         _hueTexture = new Texture2D(GraphicsDevice, 20, 144);
         UpdateSaturationValueTexture();
@@ -130,21 +148,28 @@ public sealed class PixologyGame : Game
 
         if (_isEditing)
         {
-            if (keyboard.IsKeyDown(Keys.B))
-                _activeTool = EditorTool.Brush;
-            else if (keyboard.IsKeyDown(Keys.E))
-                _activeTool = EditorTool.Erase;
-            else if (keyboard.IsKeyDown(Keys.P))
-                _activeTool = EditorTool.PaintBucket;
-
-            if (keyboard.IsKeyDown(Keys.G) && !_previousKeyboard.IsKeyDown(Keys.G))
-                _showGrid = !_showGrid;
-
             var commandOrControlDown =
                 keyboard.IsKeyDown(Keys.LeftControl) ||
                 keyboard.IsKeyDown(Keys.RightControl) ||
                 keyboard.IsKeyDown(Keys.LeftWindows) ||
                 keyboard.IsKeyDown(Keys.RightWindows);
+
+            if (!commandOrControlDown && keyboard.IsKeyDown(Keys.B))
+                _activeTool = EditorTool.Brush;
+            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.E))
+                _activeTool = EditorTool.Erase;
+            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.P))
+                _activeTool = EditorTool.PaintBucket;
+            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.C) &&
+                     !_previousKeyboard.IsKeyDown(Keys.C))
+                ActivateCropTool();
+            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.I))
+                _activeTool = EditorTool.Eyedropper;
+
+            if (keyboard.IsKeyDown(Keys.G) && !_previousKeyboard.IsKeyDown(Keys.G))
+                _showGrid = !_showGrid;
+
+            HandleHexClipboardShortcuts(keyboard, commandOrControlDown);
             if (commandOrControlDown &&
                 keyboard.IsKeyDown(Keys.Z) &&
                 !_previousKeyboard.IsKeyDown(Keys.Z))
@@ -174,7 +199,12 @@ public sealed class PixologyGame : Game
         if (_isEditing && justPressedLeft && !_isPanning)
         {
             HandleEditorClick(mouse.Position);
-            if (IsInsideCanvas(mouse.Position))
+            if (_activeTool == EditorTool.Crop && _cropSelectionInitialized &&
+                GetWorkspaceBounds(GraphicsDevice.Viewport).Contains(mouse.Position))
+                BeginCrop(mouse.Position);
+            else if (_activeTool == EditorTool.Eyedropper)
+                SampleCanvasColor(mouse.Position);
+            else if (_activeTool != EditorTool.Crop && IsInsideCanvas(mouse.Position))
                 BeginStroke();
         }
         else if (!_isEditing && justPressedLeft)
@@ -196,6 +226,9 @@ public sealed class PixologyGame : Game
             DrawOnCanvas(start, mouse.Position);
         }
 
+        if (_isCropping && leftPressed)
+            UpdateCrop(mouse.Position);
+
         if (_isEditing && _colorPickerDrag != ColorPickerDrag.None && leftPressed)
             UpdateColorPicker(mouse.Position);
         if (!leftPressed)
@@ -203,6 +236,8 @@ public sealed class PixologyGame : Game
 
         if (_isDrawingStroke && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
             FinishStroke();
+        if (_isCropping && _previousMouse.LeftButton == ButtonState.Pressed && !leftPressed)
+            FinishCrop();
 
         if (_isPanning && !middlePressed && !(leftPressed && spacePressed))
             _isPanning = false;
@@ -215,7 +250,7 @@ public sealed class PixologyGame : Game
 
     protected override void Draw(GameTime gameTime)
     {
-        GraphicsDevice.Clear(Color.White);
+        GraphicsDevice.Clear(_isEditing ? Color.White : PixologyPalette.TitleBackground);
 
         var mouse = Mouse.GetState();
         if (_isEditing)
@@ -254,14 +289,57 @@ public sealed class PixologyGame : Game
         secondButton.X += ButtonWidth + ButtonGap;
 
         const string title = "Pixology";
-        var titleSize = _titleFont.MeasureString(title);
+        var titleSize = _titleFont.MeasureString(title) * StartScreenTextScale;
         var titlePosition = new Vector2(
             MathF.Round((viewport.Width - titleSize.X) / 2),
             MathF.Round(firstButton.Y - titleSize.Y - 28));
-        DrawPixelText(_titleFont, title, titlePosition, new Color(0x1e, 0x58, 0xbe));
+        DrawTwoToneTitle(title, titlePosition, titleSize);
 
-        DrawButton(firstButton, "New", mouse);
-        DrawButton(secondButton, "Open File", mouse);
+        DrawButton(firstButton, "New", mouse, StartScreenButtonTextScale);
+        DrawButton(secondButton, "Open File", mouse, StartScreenButtonTextScale);
+    }
+
+    private void DrawTwoToneTitle(string title, Vector2 position, Vector2 size)
+    {
+        var titleBounds = new Rectangle(
+            (int)position.X,
+            (int)position.Y,
+            (int)MathF.Ceiling(size.X),
+            (int)MathF.Ceiling(size.Y));
+        var topBounds = titleBounds;
+        topBounds.Height = (titleBounds.Height + 1) / 2;
+        var bottomBounds = new Rectangle(
+            titleBounds.X,
+            titleBounds.Y + topBounds.Height,
+            titleBounds.Width,
+            titleBounds.Height - topBounds.Height);
+        var viewportBounds = GraphicsDevice.Viewport.Bounds;
+        var previousScissor = GraphicsDevice.ScissorRectangle;
+
+        _spriteBatch.End();
+        GraphicsDevice.ScissorRectangle = Rectangle.Intersect(viewportBounds, topBounds);
+        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, rasterizerState: _canvasRasterizer);
+        DrawPixelText(_titleFont, title, position, PixologyPalette.TitleTopPink, StartScreenTextScale);
+        _spriteBatch.End();
+
+        GraphicsDevice.ScissorRectangle = Rectangle.Intersect(viewportBounds, bottomBounds);
+        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, rasterizerState: _canvasRasterizer);
+        DrawPixelText(_titleFont, title, position, PixologyPalette.TitleBottomPink, StartScreenTextScale);
+        _spriteBatch.End();
+
+        GraphicsDevice.ScissorRectangle = previousScissor;
+        _spriteBatch.Begin(samplerState: SamplerState.PointClamp);
+    }
+
+    private static void MakeFontPixelPerfect(SpriteFont font)
+    {
+        var texture = font.Texture;
+        var pixels = new byte[texture.Width * texture.Height];
+        texture.GetData(pixels);
+        for (var index = 0; index < pixels.Length; index++)
+            pixels[index] = pixels[index] >= 128 ? byte.MaxValue : byte.MinValue;
+
+        texture.SetData(pixels);
     }
 
     private void DrawEditor(MouseState mouse)
@@ -281,6 +359,8 @@ public sealed class PixologyGame : Game
         DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), "Brush", EditorTool.Brush, mouse);
         DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), "Erase", EditorTool.Erase, mouse);
         DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), "Bucket", EditorTool.PaintBucket, mouse);
+        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Crop (C)", EditorTool.Crop, mouse);
+        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), "Dropper", EditorTool.Eyedropper, mouse);
 
         var checkbox = new Rectangle(124, 17, 22, 22);
         DrawRectangle(checkbox, Color.White);
@@ -309,6 +389,14 @@ public sealed class PixologyGame : Game
 
             DrawPixelText("Contiguous", new Vector2(308, 17), Color.Black);
         }
+        else if (_activeTool == EditorTool.Crop)
+        {
+            DrawPixelText("Drag crop edges (16px snap)", new Vector2(440, 17), Color.Black);
+        }
+        else if (_activeTool == EditorTool.Eyedropper)
+        {
+            DrawPixelText("Click a pixel to pick its color", new Vector2(440, 17), Color.Black);
+        }
 
         DrawColorPicker(rightSidebar);
 
@@ -330,7 +418,10 @@ public sealed class PixologyGame : Game
         _spriteBatch.Draw(_canvas, canvasBounds, Color.White);
         if (_showGrid)
             DrawCanvasGrid(canvasBounds);
-        DrawBrushCursor(canvasBounds, mousePosition);
+        if (_activeTool == EditorTool.Crop)
+            DrawCropSelection(canvasBounds, mousePosition);
+        else
+            DrawBrushCursor(canvasBounds, mousePosition);
     }
 
     private void DrawBrushCursor(Rectangle canvasBounds, Point mousePosition)
@@ -338,13 +429,13 @@ public sealed class PixologyGame : Game
         if (!TryGetCanvasPixel(mousePosition, canvasBounds, out var pixelX, out var pixelY))
             return;
 
-        var pixelScale = canvasBounds.Width / CanvasSize;
+        var pixelScale = canvasBounds.Width / _canvasWidth;
         var toolSize = _activeTool == EditorTool.Erase ? 2 : 1;
         var cursorBounds = new Rectangle(
             canvasBounds.X + pixelX * pixelScale,
             canvasBounds.Y + pixelY * pixelScale,
-            Math.Min(toolSize, CanvasSize - pixelX) * pixelScale,
-            Math.Min(toolSize, CanvasSize - pixelY) * pixelScale);
+            Math.Min(toolSize, _canvasWidth - pixelX) * pixelScale,
+            Math.Min(toolSize, _canvasHeight - pixelY) * pixelScale);
 
         DrawOutline(cursorBounds, Color.White, 4);
         if (cursorBounds.Width > 4 && cursorBounds.Height > 4)
@@ -360,13 +451,60 @@ public sealed class PixologyGame : Game
 
     private void DrawCanvasGrid(Rectangle canvasBounds)
     {
-        var cellWidth = canvasBounds.Width / 2;
-        var cellHeight = canvasBounds.Height / 2;
         var gridColor = new Color(0, 0, 0, 110);
+        var pixelScale = canvasBounds.Width / _canvasWidth;
 
-        DrawRectangle(new Rectangle(canvasBounds.X + cellWidth - 1, canvasBounds.Y, 2, canvasBounds.Height), gridColor);
-        DrawRectangle(new Rectangle(canvasBounds.X, canvasBounds.Y + cellHeight - 1, canvasBounds.Width, 2), gridColor);
+        for (var x = CropSnapSize; x < _canvasWidth; x += CropSnapSize)
+            DrawRectangle(new Rectangle(canvasBounds.X + x * pixelScale - 1, canvasBounds.Y, 2, canvasBounds.Height), gridColor);
+        for (var y = CropSnapSize; y < _canvasHeight; y += CropSnapSize)
+            DrawRectangle(new Rectangle(canvasBounds.X, canvasBounds.Y + y * pixelScale - 1, canvasBounds.Width, 2), gridColor);
         DrawOutline(canvasBounds, gridColor, 2);
+    }
+
+    private void DrawCropSelection(Rectangle canvasBounds, Point mousePosition)
+    {
+        if (!_cropSelectionInitialized)
+            return;
+
+        var pixelScale = canvasBounds.Width / (float)_canvasWidth;
+        var bounds = new Rectangle(
+            (int)MathF.Round(canvasBounds.X + _cropSelection.X * pixelScale),
+            (int)MathF.Round(canvasBounds.Y + _cropSelection.Y * pixelScale),
+            (int)MathF.Round(_cropSelection.Width * pixelScale),
+            (int)MathF.Round(_cropSelection.Height * pixelScale));
+        DrawRectangle(bounds, new Color(80, 140, 220, 35));
+        DrawOutline(bounds, new Color(30, 90, 180), 2);
+        const int handleSize = 8;
+        var halfHandle = handleSize / 2;
+        var handlePoints = new[]
+        {
+            new Point(bounds.Left, bounds.Top),
+            new Point(bounds.Center.X, bounds.Top),
+            new Point(bounds.Right, bounds.Top),
+            new Point(bounds.Left, bounds.Center.Y),
+            new Point(bounds.Right, bounds.Center.Y),
+            new Point(bounds.Left, bounds.Bottom),
+            new Point(bounds.Center.X, bounds.Bottom),
+            new Point(bounds.Right, bounds.Bottom)
+        };
+        foreach (var point in handlePoints)
+        {
+            var handle = new Rectangle(
+                point.X - halfHandle,
+                point.Y - halfHandle,
+                handleSize,
+                handleSize);
+            DrawRectangle(handle, Color.White);
+            DrawOutline(handle, new Color(30, 90, 180), 1);
+        }
+
+        var sizeLabel = $"{_cropSelection.Width} x {_cropSelection.Height}";
+        var labelSize = _font.MeasureString(sizeLabel);
+        var workspace = GetWorkspaceBounds(GraphicsDevice.Viewport);
+        var labelPosition = new Vector2(
+            Math.Clamp(mousePosition.X + 16, workspace.Left, workspace.Right - (int)labelSize.X),
+            Math.Clamp(mousePosition.Y + 16, workspace.Top, workspace.Bottom - (int)labelSize.Y));
+        DrawPixelText(sizeLabel, labelPosition, Color.Black);
     }
 
     private void HandleStartScreenClick(Point position)
@@ -403,7 +541,7 @@ public sealed class PixologyGame : Game
     {
         _isDrawingStroke = false;
         if (_strokeChanged)
-            _undoHistory.Push(_strokeSnapshot);
+            _undoHistory.Push(new CanvasSnapshot(_canvasWidth, _canvasHeight, _strokeSnapshot));
 
         _strokeSnapshot = Array.Empty<Color>();
         _strokeChanged = false;
@@ -414,8 +552,205 @@ public sealed class PixologyGame : Game
         if (_undoHistory.Count == 0)
             return;
 
-        _canvasPixels = _undoHistory.Pop();
+        var snapshot = _undoHistory.Pop();
+        _canvasWidth = snapshot.Width;
+        _canvasHeight = snapshot.Height;
+        _canvasPixels = snapshot.Pixels;
+        RebuildCanvasTextures();
+    }
+
+    private void BeginCrop(Point position)
+    {
+        var selectionBounds = GetCropSelectionBounds();
+        _cropDragMode = GetCropDragMode(position, selectionBounds);
+        if (_cropDragMode == CropDragMode.None || !TryGetCropGridPoint(position, out _cropDragStart))
+            return;
+
+        _isCropping = true;
+        _cropDragSelection = _cropSelection;
+    }
+
+    private void UpdateCrop(Point position)
+    {
+        if (TryGetCropGridPoint(position, out var cropPoint))
+            _cropSelection = ResizeCropSelection(cropPoint);
+    }
+
+    private Rectangle GetCropSelectionBounds()
+    {
+        var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
+        var pixelScale = canvasBounds.Width / (float)_canvasWidth;
+        return new Rectangle(
+            (int)MathF.Round(canvasBounds.X + _cropSelection.X * pixelScale),
+            (int)MathF.Round(canvasBounds.Y + _cropSelection.Y * pixelScale),
+            (int)MathF.Round(_cropSelection.Width * pixelScale),
+            (int)MathF.Round(_cropSelection.Height * pixelScale));
+    }
+
+    private static CropDragMode GetCropDragMode(Point position, Rectangle bounds)
+    {
+        const int handleRadius = 12;
+        var nearLeft = Math.Abs(position.X - bounds.Left) <= handleRadius;
+        var nearRight = Math.Abs(position.X - bounds.Right) <= handleRadius;
+        var nearTop = Math.Abs(position.Y - bounds.Top) <= handleRadius;
+        var nearBottom = Math.Abs(position.Y - bounds.Bottom) <= handleRadius;
+        var withinHorizontalBounds = position.X >= bounds.Left - handleRadius &&
+                                     position.X <= bounds.Right + handleRadius;
+        var withinVerticalBounds = position.Y >= bounds.Top - handleRadius &&
+                                   position.Y <= bounds.Bottom + handleRadius;
+
+        if (nearLeft && nearTop)
+            return CropDragMode.TopLeft;
+        if (nearRight && nearTop)
+            return CropDragMode.TopRight;
+        if (nearLeft && nearBottom)
+            return CropDragMode.BottomLeft;
+        if (nearRight && nearBottom)
+            return CropDragMode.BottomRight;
+        if (nearLeft && withinVerticalBounds)
+            return CropDragMode.Left;
+        if (nearRight && withinVerticalBounds)
+            return CropDragMode.Right;
+        if (nearTop && withinHorizontalBounds)
+            return CropDragMode.Top;
+        if (nearBottom && withinHorizontalBounds)
+            return CropDragMode.Bottom;
+        if (bounds.Contains(position))
+            return CropDragMode.Move;
+        return CropDragMode.None;
+    }
+
+    private Rectangle ResizeCropSelection(Point cropPoint)
+    {
+        var deltaX = cropPoint.X - _cropDragStart.X;
+        var deltaY = cropPoint.Y - _cropDragStart.Y;
+        var left = _cropDragSelection.Left;
+        var top = _cropDragSelection.Top;
+        var right = _cropDragSelection.Right;
+        var bottom = _cropDragSelection.Bottom;
+
+        switch (_cropDragMode)
+        {
+            case CropDragMode.Move:
+                left += deltaX;
+                right += deltaX;
+                top += deltaY;
+                bottom += deltaY;
+                break;
+            case CropDragMode.Left:
+            case CropDragMode.TopLeft:
+            case CropDragMode.BottomLeft:
+                left = Math.Min(cropPoint.X, right - CropSnapSize);
+                break;
+        }
+
+        if (_cropDragMode is CropDragMode.Right or CropDragMode.TopRight or CropDragMode.BottomRight)
+            right = Math.Max(cropPoint.X, left + CropSnapSize);
+
+        if (_cropDragMode is CropDragMode.Top or CropDragMode.TopLeft or CropDragMode.TopRight)
+            top = Math.Min(cropPoint.Y, bottom - CropSnapSize);
+
+        if (_cropDragMode is CropDragMode.Bottom or CropDragMode.BottomLeft or CropDragMode.BottomRight)
+            bottom = Math.Max(cropPoint.Y, top + CropSnapSize);
+
+        if (_cropDragMode == CropDragMode.Move)
+        {
+            left = Math.Clamp(left, -4096, 4096 - _cropDragSelection.Width);
+            top = Math.Clamp(top, -4096, 4096 - _cropDragSelection.Height);
+            right = left + _cropDragSelection.Width;
+            bottom = top + _cropDragSelection.Height;
+        }
+
+        left = Math.Max(left, right - 4096);
+        right = Math.Min(right, left + 4096);
+        top = Math.Max(top, bottom - 4096);
+        bottom = Math.Min(bottom, top + 4096);
+        return new Rectangle(left, top, right - left, bottom - top);
+    }
+
+    private bool TryGetCropGridPoint(Point position, out Point cropPoint)
+    {
+        var workspace = GetWorkspaceBounds(GraphicsDevice.Viewport);
+        position.X = Math.Clamp(position.X, workspace.Left, workspace.Right - 1);
+        position.Y = Math.Clamp(position.Y, workspace.Top, workspace.Bottom - 1);
+        var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
+        var pixelScale = canvasBounds.Width / (float)_canvasWidth;
+        var x = (int)MathF.Round((position.X - canvasBounds.X) / pixelScale / CropSnapSize) * CropSnapSize;
+        var y = (int)MathF.Round((position.Y - canvasBounds.Y) / pixelScale / CropSnapSize) * CropSnapSize;
+        cropPoint = new Point(x, y);
+        return true;
+    }
+
+    private void FinishCrop()
+    {
+        _isCropping = false;
+        if (_cropSelection.Width <= 0 || _cropSelection.Height <= 0 ||
+            (_cropSelection.X == 0 && _cropSelection.Y == 0 &&
+             _cropSelection.Width == _canvasWidth && _cropSelection.Height == _canvasHeight))
+            return;
+
+        var resizedPixels = new Color[_cropSelection.Width * _cropSelection.Height];
+        for (var y = 0; y < _cropSelection.Height; y++)
+        {
+            var sourceY = _cropSelection.Y + y;
+            if (sourceY < 0 || sourceY >= _canvasHeight)
+                continue;
+
+            for (var x = 0; x < _cropSelection.Width; x++)
+            {
+                var sourceX = _cropSelection.X + x;
+                if (sourceX >= 0 && sourceX < _canvasWidth)
+                    resizedPixels[y * _cropSelection.Width + x] = _canvasPixels[sourceY * _canvasWidth + sourceX];
+            }
+        }
+
+        _undoHistory.Push(new CanvasSnapshot(_canvasWidth, _canvasHeight, (Color[])_canvasPixels.Clone()));
+        _canvasWidth = _cropSelection.Width;
+        _canvasHeight = _cropSelection.Height;
+        _canvasPixels = resizedPixels;
+        RebuildCanvasTextures();
+        _cropSelection = new Rectangle(0, 0, _canvasWidth, _canvasHeight);
+    }
+
+    private void ActivateCropTool()
+    {
+        _activeTool = EditorTool.Crop;
+        _cropSelection = new Rectangle(0, 0, _canvasWidth, _canvasHeight);
+        _cropSelectionInitialized = true;
+        _isCropping = false;
+    }
+
+    private void SampleCanvasColor(Point position)
+    {
+        var canvasBounds = GetCanvasBounds(GraphicsDevice.Viewport);
+        if (!TryGetCanvasPixel(position, canvasBounds, out var pixelX, out var pixelY))
+            return;
+
+        _selectedColor = _canvasPixels[pixelY * _canvasWidth + pixelX];
+        UpdateHsvFromSelectedColor();
+    }
+
+    private void RebuildCanvasTextures()
+    {
+        _canvas?.Dispose();
+        _checkerboard?.Dispose();
+        _canvas = new Texture2D(GraphicsDevice, _canvasWidth, _canvasHeight);
         _canvas.SetData(_canvasPixels);
+        _checkerboard = new Texture2D(GraphicsDevice, _canvasWidth, _canvasHeight);
+
+        var checkerboardPixels = new Color[_canvasWidth * _canvasHeight];
+        for (var y = 0; y < _canvasHeight; y++)
+        {
+            for (var x = 0; x < _canvasWidth; x++)
+            {
+                var isLight = ((x / 8) + (y / 8)) % 2 == 0;
+                checkerboardPixels[y * _canvasWidth + x] = isLight
+                    ? new Color(238, 238, 238)
+                    : Color.White;
+            }
+        }
+
+        _checkerboard.SetData(checkerboardPixels);
     }
 
     private void DrawOnCanvas(Point start, Point end)
@@ -468,11 +803,11 @@ public sealed class PixologyGame : Game
         var size = _activeTool == EditorTool.Erase ? 2 : 1;
         var color = _activeTool == EditorTool.Erase ? Color.Transparent : _selectedColor;
 
-        for (var offsetY = 0; offsetY < size && y + offsetY < CanvasSize; offsetY++)
+        for (var offsetY = 0; offsetY < size && y + offsetY < _canvasHeight; offsetY++)
         {
-            for (var offsetX = 0; offsetX < size && x + offsetX < CanvasSize; offsetX++)
+            for (var offsetX = 0; offsetX < size && x + offsetX < _canvasWidth; offsetX++)
             {
-                var index = (y + offsetY) * CanvasSize + x + offsetX;
+                var index = (y + offsetY) * _canvasWidth + x + offsetX;
                 if (_canvasPixels[index] == color)
                     continue;
 
@@ -486,7 +821,7 @@ public sealed class PixologyGame : Game
 
     private bool FillArea(int x, int y)
     {
-        var startIndex = y * CanvasSize + x;
+        var startIndex = y * _canvasWidth + x;
         var targetColor = _canvasPixels[startIndex];
         if (targetColor == _selectedColor)
             return false;
@@ -513,17 +848,17 @@ public sealed class PixologyGame : Game
         while (pending.Count > 0)
         {
             var index = pending.Dequeue();
-            var pixelX = index % CanvasSize;
-            var pixelY = index / CanvasSize;
+            var pixelX = index % _canvasWidth;
+            var pixelY = index / _canvasWidth;
 
             if (pixelX > 0)
                 AddMatchingPixel(index - 1, targetColor, pending);
-            if (pixelX < CanvasSize - 1)
+            if (pixelX < _canvasWidth - 1)
                 AddMatchingPixel(index + 1, targetColor, pending);
             if (pixelY > 0)
-                AddMatchingPixel(index - CanvasSize, targetColor, pending);
-            if (pixelY < CanvasSize - 1)
-                AddMatchingPixel(index + CanvasSize, targetColor, pending);
+                AddMatchingPixel(index - _canvasWidth, targetColor, pending);
+            if (pixelY < _canvasHeight - 1)
+                AddMatchingPixel(index + _canvasWidth, targetColor, pending);
         }
 
         return true;
@@ -548,8 +883,8 @@ public sealed class PixologyGame : Game
             return false;
         }
 
-        x = (position.X - canvasBounds.X) * CanvasSize / canvasBounds.Width;
-        y = (position.Y - canvasBounds.Y) * CanvasSize / canvasBounds.Height;
+        x = (position.X - canvasBounds.X) * _canvasWidth / canvasBounds.Width;
+        y = (position.Y - canvasBounds.Y) * _canvasHeight / canvasBounds.Height;
         return true;
     }
 
@@ -562,6 +897,13 @@ public sealed class PixologyGame : Game
     private void HandleEditorClick(Point position)
     {
         var pickerBounds = GetColorPickerBounds(GraphicsDevice.Viewport);
+        if (pickerBounds.HexBounds.Contains(position))
+        {
+            _hexSelected = true;
+            return;
+        }
+
+        _hexSelected = false;
         if (pickerBounds.SaturationValue.Contains(position))
         {
             _colorPickerDrag = ColorPickerDrag.SaturationValue;
@@ -594,6 +936,18 @@ public sealed class PixologyGame : Game
             return;
         }
 
+        if (new Rectangle(8, 264, SidebarWidth - 16, 56).Contains(position))
+        {
+            ActivateCropTool();
+            return;
+        }
+
+        if (new Rectangle(8, 328, SidebarWidth - 16, 56).Contains(position))
+        {
+            _activeTool = EditorTool.Eyedropper;
+            return;
+        }
+
         if (new Rectangle(12, 8, 92, 40).Contains(position))
         {
             SaveCanvas();
@@ -615,12 +969,190 @@ public sealed class PixologyGame : Game
         }
     }
 
+    private void HandleHexClipboardShortcuts(KeyboardState keyboard, bool commandOrControlDown)
+    {
+        if (!_hexSelected || !commandOrControlDown)
+            return;
+
+        if (keyboard.IsKeyDown(Keys.C) && !_previousKeyboard.IsKeyDown(Keys.C))
+        {
+            SetSystemClipboardText(GetSelectedHexColor());
+        }
+        else if (keyboard.IsKeyDown(Keys.V) && !_previousKeyboard.IsKeyDown(Keys.V))
+        {
+            if (!TryGetSystemClipboardText(out var clipboardText))
+                return;
+
+            var hex = clipboardText.Trim();
+            if (hex.StartsWith('#'))
+                hex = hex[1..];
+
+            if (hex.Length != 6 || !uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rgb))
+            {
+                _saveMessage = "Clipboard text is not a #RRGGBB color";
+                return;
+            }
+
+            _selectedColor = new Color(
+                (byte)(rgb >> 16),
+                (byte)(rgb >> 8),
+                (byte)rgb);
+            UpdateHsvFromSelectedColor();
+            _saveMessage = $"Selected {GetSelectedHexColor()}";
+        }
+    }
+
+    private string GetSelectedHexColor()
+    {
+        return $"#{_selectedColor.R:X2}{_selectedColor.G:X2}{_selectedColor.B:X2}";
+    }
+
+    private void UpdateHsvFromSelectedColor()
+    {
+        var red = _selectedColor.R / 255f;
+        var green = _selectedColor.G / 255f;
+        var blue = _selectedColor.B / 255f;
+        var maximum = Math.Max(red, Math.Max(green, blue));
+        var minimum = Math.Min(red, Math.Min(green, blue));
+        var delta = maximum - minimum;
+
+        _selectedHue = delta == 0f
+            ? 0f
+            : maximum == red
+                ? ((green - blue) / delta % 6f) / 6f
+                : maximum == green
+                    ? ((blue - red) / delta + 2f) / 6f
+                    : ((red - green) / delta + 4f) / 6f;
+        if (_selectedHue < 0f)
+            _selectedHue += 1f;
+        _selectedSaturation = maximum == 0f ? 0f : delta / maximum;
+        _selectedValue = maximum;
+        UpdateSaturationValueTexture();
+    }
+
+    private void SetSystemClipboardText(string text)
+    {
+        try
+        {
+            var result = OperatingSystem.IsMacOS()
+                ? SdlClipboard.SetClipboardTextMac(text)
+                : OperatingSystem.IsWindows()
+                    ? SdlClipboard.SetClipboardTextWindows(text)
+                    : SdlClipboard.SetClipboardTextLinux(text);
+            _saveMessage = result == 0
+                ? $"Copied {text}"
+                : $"Could not copy color: {SdlClipboard.GetError()}";
+        }
+        catch (DllNotFoundException exception)
+        {
+            _saveMessage = $"Clipboard unavailable: {exception.Message}";
+        }
+        catch (EntryPointNotFoundException exception)
+        {
+            _saveMessage = $"Clipboard unavailable: {exception.Message}";
+        }
+    }
+
+    private bool TryGetSystemClipboardText(out string text)
+    {
+        try
+        {
+            var clipboard = OperatingSystem.IsMacOS()
+                ? SdlClipboard.GetClipboardTextMac()
+                : OperatingSystem.IsWindows()
+                    ? SdlClipboard.GetClipboardTextWindows()
+                    : SdlClipboard.GetClipboardTextLinux();
+            if (clipboard == IntPtr.Zero)
+            {
+                _saveMessage = $"Could not paste color: {SdlClipboard.GetError()}";
+                text = string.Empty;
+                return false;
+            }
+
+            try
+            {
+                text = Marshal.PtrToStringUTF8(clipboard) ?? string.Empty;
+                return true;
+            }
+            finally
+            {
+                if (OperatingSystem.IsMacOS())
+                    SdlClipboard.FreeMac(clipboard);
+                else if (OperatingSystem.IsWindows())
+                    SdlClipboard.FreeWindows(clipboard);
+                else
+                    SdlClipboard.FreeLinux(clipboard);
+            }
+        }
+        catch (DllNotFoundException exception)
+        {
+            _saveMessage = $"Clipboard unavailable: {exception.Message}";
+            text = string.Empty;
+            return false;
+        }
+        catch (EntryPointNotFoundException exception)
+        {
+            _saveMessage = $"Clipboard unavailable: {exception.Message}";
+            text = string.Empty;
+            return false;
+        }
+    }
+
+    private static class SdlClipboard
+    {
+        [DllImport("libSDL2-2.0.0.dylib", EntryPoint = "SDL_SetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int SetClipboardTextMac([MarshalAs(UnmanagedType.LPUTF8Str)] string text);
+
+        [DllImport("SDL2.dll", EntryPoint = "SDL_SetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int SetClipboardTextWindows([MarshalAs(UnmanagedType.LPUTF8Str)] string text);
+
+        [DllImport("libSDL2-2.0.so.0", EntryPoint = "SDL_SetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int SetClipboardTextLinux([MarshalAs(UnmanagedType.LPUTF8Str)] string text);
+
+        [DllImport("libSDL2-2.0.0.dylib", EntryPoint = "SDL_GetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr GetClipboardTextMac();
+
+        [DllImport("SDL2.dll", EntryPoint = "SDL_GetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr GetClipboardTextWindows();
+
+        [DllImport("libSDL2-2.0.so.0", EntryPoint = "SDL_GetClipboardText", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr GetClipboardTextLinux();
+
+        [DllImport("libSDL2-2.0.0.dylib", EntryPoint = "SDL_free", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void FreeMac(IntPtr memory);
+
+        [DllImport("SDL2.dll", EntryPoint = "SDL_free", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void FreeWindows(IntPtr memory);
+
+        [DllImport("libSDL2-2.0.so.0", EntryPoint = "SDL_free", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void FreeLinux(IntPtr memory);
+
+        [DllImport("libSDL2-2.0.0.dylib", EntryPoint = "SDL_GetError", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr GetErrorMac();
+
+        [DllImport("SDL2.dll", EntryPoint = "SDL_GetError", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr GetErrorWindows();
+
+        [DllImport("libSDL2-2.0.so.0", EntryPoint = "SDL_GetError", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr GetErrorLinux();
+
+        internal static string GetError()
+        {
+            var error = OperatingSystem.IsMacOS()
+                ? GetErrorMac()
+                : OperatingSystem.IsWindows()
+                    ? GetErrorWindows()
+                    : GetErrorLinux();
+            return Marshal.PtrToStringUTF8(error) ?? "unknown SDL clipboard error";
+        }
+    }
+
     private void SaveCanvas()
     {
         var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         var filePath = Path.Combine(desktopPath, "image.png");
         using var stream = File.Create(filePath);
-        _canvas.SaveAsPng(stream, CanvasSize, CanvasSize);
+        _canvas.SaveAsPng(stream, _canvasWidth, _canvasHeight);
         _saveMessage = "Saved image.png to Desktop";
     }
 
@@ -664,13 +1196,14 @@ public sealed class PixologyGame : Game
             Math.Max(0, viewport.Height - ToolbarHeight));
     }
 
-    private static (Rectangle SaturationValue, Rectangle Hue, Rectangle Swatch) GetColorPickerBounds(Viewport viewport)
+    private static (Rectangle SaturationValue, Rectangle Hue, Rectangle HexBounds, Vector2 HexPosition) GetColorPickerBounds(Viewport viewport)
     {
         var sidebar = GetRightSidebarBounds(viewport);
         var square = new Rectangle(sidebar.X + 16, sidebar.Y + 24, 144, 144);
         var hue = new Rectangle(square.Right + 8, square.Y, 20, square.Height);
-        var swatch = new Rectangle(sidebar.X + 16, square.Bottom + 18, 168, 36);
-        return (square, hue, swatch);
+        var hexBounds = new Rectangle(sidebar.X + 12, square.Bottom + 12, 132, 36);
+        var hexPosition = new Vector2(hexBounds.X + 6, hexBounds.Y + 6);
+        return (square, hue, hexBounds, hexPosition);
     }
 
     private void DrawColorPicker(Rectangle sidebar)
@@ -692,8 +1225,10 @@ public sealed class PixologyGame : Game
         DrawOutline(new Rectangle(selectedX - 5, selectedY - 5, 11, 11), Color.White, 2);
         DrawOutline(new Rectangle(selectedX - 2, selectedY - 2, 5, 5), Color.Black, 1);
 
-        DrawRectangle(bounds.Swatch, _selectedColor);
-        DrawOutline(bounds.Swatch, Color.Black, 2);
+        var hexColor = GetSelectedHexColor();
+        DrawRectangle(bounds.HexBounds, _hexSelected ? new Color(50, 100, 170) : Color.White);
+        DrawOutline(bounds.HexBounds, Color.Black, 1);
+        DrawPixelText(hexColor, bounds.HexPosition, _hexSelected ? Color.White : Color.Black);
     }
 
     private void UpdateColorPicker(Point position)
@@ -778,15 +1313,18 @@ public sealed class PixologyGame : Game
     {
         var workspace = GetWorkspaceBounds(viewport);
         var fitScale = Math.Max(1, Math.Min(
-            (workspace.Width - 64) / CanvasSize,
-            (workspace.Height - 64) / CanvasSize));
+            (workspace.Width - 64) / _canvasWidth,
+            (workspace.Height - 64) / _canvasHeight));
+        if (_activeTool == EditorTool.Crop)
+            fitScale = Math.Max(1, fitScale / 2);
         var pixelScale = Math.Max(1, (int)MathF.Round(fitScale * _zoom));
-        var size = CanvasSize * pixelScale;
+        var width = _canvasWidth * pixelScale;
+        var height = _canvasHeight * pixelScale;
         return new Rectangle(
-            workspace.X + (workspace.Width - size) / 2 + (int)MathF.Round(_canvasPan.X),
-            workspace.Y + (workspace.Height - size) / 2 + (int)MathF.Round(_canvasPan.Y),
-            size,
-            size);
+            workspace.X + (workspace.Width - width) / 2 + (int)MathF.Round(_canvasPan.X),
+            workspace.Y + (workspace.Height - height) / 2 + (int)MathF.Round(_canvasPan.Y),
+            width,
+            height);
     }
 
     private void DrawToolButton(Rectangle bounds, string label, EditorTool tool, MouseState mouse)
@@ -804,7 +1342,7 @@ public sealed class PixologyGame : Game
         DrawPixelText(label, textPosition, Color.Black);
     }
 
-    private void DrawButton(Rectangle bounds, string label, MouseState mouse)
+    private void DrawButton(Rectangle bounds, string label, MouseState mouse, float textScale = 1f)
     {
         var hovered = bounds.Contains(mouse.Position);
         var fill = hovered ? new Color(242, 242, 242) : Color.White;
@@ -813,11 +1351,11 @@ public sealed class PixologyGame : Game
         DrawRectangle(bounds, fill);
         DrawOutline(bounds, Color.Black, borderWidth);
 
-        var textSize = _font.MeasureString(label);
+        var textSize = _font.MeasureString(label) * textScale;
         var textPosition = new Vector2(
             bounds.Center.X - textSize.X / 2,
             bounds.Center.Y - textSize.Y / 2);
-        DrawPixelText(label, textPosition, Color.Black);
+        DrawPixelText(_font, label, textPosition, Color.Black, textScale);
     }
 
     private void DrawPixelText(string text, Vector2 position, Color color)
@@ -825,7 +1363,7 @@ public sealed class PixologyGame : Game
         DrawPixelText(_font, text, position, color);
     }
 
-    private void DrawPixelText(SpriteFont font, string text, Vector2 position, Color color)
+    private void DrawPixelText(SpriteFont font, string text, Vector2 position, Color color, float scale = 1f)
     {
         var pixelPosition = new Vector2(MathF.Round(position.X), MathF.Round(position.Y));
         _spriteBatch.DrawString(
@@ -835,7 +1373,7 @@ public sealed class PixologyGame : Game
             color,
             0f,
             Vector2.Zero,
-            1f,
+            scale,
             SpriteEffects.None,
             0f);
     }
