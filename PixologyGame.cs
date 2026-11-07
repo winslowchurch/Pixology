@@ -49,6 +49,13 @@ public sealed class PixologyGame : Game
         BottomRight
     }
 
+    private enum LayerContextMenuAction
+    {
+        MergeUp,
+        MergeDown,
+        Delete
+    }
+
     private sealed class Layer
     {
         public required string Name { get; set; }
@@ -57,6 +64,7 @@ public sealed class PixologyGame : Game
     }
 
     private sealed record LayerSnapshot(string Name, float Opacity, Color[] Pixels);
+    private sealed record LayerContextMenuItem(string Label, LayerContextMenuAction Action, bool Enabled);
     private sealed record CanvasSnapshot(
         int Width,
         int Height,
@@ -98,6 +106,8 @@ public sealed class PixologyGame : Game
     private bool _isCropping;
     private bool _cropSelectionInitialized;
     private bool _hexSelected;
+    private bool _hexTextSelectionActive;
+    private string _hexEditText = string.Empty;
     private bool _showOpenFileDialog;
     private EditorTool _activeTool;
     private ColorPickerDrag _colorPickerDrag;
@@ -141,6 +151,7 @@ public sealed class PixologyGame : Game
     private float _zoom = 1f;
     private MacTrackpadPinch _trackpadPinch = null!;
     private string _saveMessage = string.Empty;
+    private string _canvasSaveFileName = "image";
     private MouseState _previousMouse;
     private KeyboardState _previousKeyboard;
 
@@ -156,6 +167,7 @@ public sealed class PixologyGame : Game
         IsMouseVisible = true;
         Window.Title = "Pixology";
         Window.AllowUserResizing = true;
+        Window.TextInput += HandleTextInput;
     }
 
     protected override void LoadContent()
@@ -163,8 +175,6 @@ public sealed class PixologyGame : Game
         _spriteBatch = new SpriteBatch(GraphicsDevice);
         _font = Content.Load<SpriteFont>("PixelFont");
         _titleFont = Content.Load<SpriteFont>("PixelFontTitle");
-        MakeFontPixelPerfect(_font);
-        MakeFontPixelPerfect(_titleFont);
         _canvasRasterizer = new RasterizerState { ScissorTestEnable = true };
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
@@ -202,23 +212,33 @@ public sealed class PixologyGame : Game
                 keyboard.IsKeyDown(Keys.LeftWindows) ||
                 keyboard.IsKeyDown(Keys.RightWindows);
 
-            if (!commandOrControlDown && keyboard.IsKeyDown(Keys.B))
+            if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.B))
                 _activeTool = EditorTool.Brush;
-            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.E))
+            else if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.E))
                 _activeTool = EditorTool.Erase;
-            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.P))
+            else if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.P))
                 _activeTool = EditorTool.PaintBucket;
-            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.C) &&
+            else if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.C) &&
                      !_previousKeyboard.IsKeyDown(Keys.C))
                 ActivateCropTool();
-            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.I))
+            else if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.I))
                 _activeTool = EditorTool.Eyedropper;
-            else if (!commandOrControlDown && keyboard.IsKeyDown(Keys.V) &&
-                     !_previousKeyboard.IsKeyDown(Keys.V))
+            else if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.S) &&
+                     !_previousKeyboard.IsKeyDown(Keys.S))
                 ActivateSelectionTool();
 
-            if (keyboard.IsKeyDown(Keys.G) && !_previousKeyboard.IsKeyDown(Keys.G))
+            if (!_hexSelected && keyboard.IsKeyDown(Keys.G) && !_previousKeyboard.IsKeyDown(Keys.G))
                 _showGrid = !_showGrid;
+
+            if (_hexSelected && keyboard.IsKeyDown(Keys.Back) &&
+                !_previousKeyboard.IsKeyDown(Keys.Back))
+                EditHexText(string.Empty, backspace: true);
+            if (_hexSelected && keyboard.IsKeyDown(Keys.Enter) &&
+                !_previousKeyboard.IsKeyDown(Keys.Enter))
+            {
+                _hexSelected = false;
+                _hexTextSelectionActive = false;
+            }
 
             HandleHexClipboardShortcuts(keyboard, commandOrControlDown);
             if (commandOrControlDown &&
@@ -350,7 +370,7 @@ public sealed class PixologyGame : Game
         var mouse = Mouse.GetState();
         if (_isEditing)
         {
-            _spriteBatch.Begin(samplerState: SamplerState.PointClamp);
+            _spriteBatch.Begin(samplerState: SamplerState.LinearClamp);
             DrawEditor(mouse);
             _spriteBatch.End();
 
@@ -364,7 +384,7 @@ public sealed class PixologyGame : Game
         }
         else
         {
-            _spriteBatch.Begin(samplerState: SamplerState.PointClamp);
+            _spriteBatch.Begin(samplerState: SamplerState.LinearClamp);
             DrawStartScreen(mouse);
             if (_showOpenFileDialog)
                 DrawOpenFileDialog(mouse);
@@ -390,7 +410,7 @@ public sealed class PixologyGame : Game
         var titlePosition = new Vector2(
             MathF.Round((viewport.Width - titleSize.X) / 2),
             MathF.Round(firstButton.Y - titleSize.Y - 28));
-        DrawTwoToneTitle(title, titlePosition, titleSize);
+        DrawPixelText(_titleFont, title, titlePosition, PixologyPalette.TitleText, StartScreenTextScale);
 
         DrawButton(firstButton, "New", mouse, StartScreenButtonTextScale);
         DrawButton(secondButton, "Open File", mouse, StartScreenButtonTextScale);
@@ -707,6 +727,7 @@ public sealed class PixologyGame : Game
             _canvasWidth = image.Width;
             _canvasHeight = image.Height;
             _canvasPixels = pixels;
+            _canvasSaveFileName = Path.GetFileNameWithoutExtension(path);
             _layers.Clear();
             _layers.Add(new Layer { Name = Path.GetFileNameWithoutExtension(path), Pixels = pixels });
             _activeLayerIndex = 0;
@@ -766,49 +787,6 @@ public sealed class PixologyGame : Game
         return length == 0 ? ellipsis : text[..length] + ellipsis;
     }
 
-    private void DrawTwoToneTitle(string title, Vector2 position, Vector2 size)
-    {
-        var titleBounds = new Rectangle(
-            (int)position.X,
-            (int)position.Y,
-            (int)MathF.Ceiling(size.X),
-            (int)MathF.Ceiling(size.Y));
-        var topBounds = titleBounds;
-        topBounds.Height = (titleBounds.Height + 1) / 2;
-        var bottomBounds = new Rectangle(
-            titleBounds.X,
-            titleBounds.Y + topBounds.Height,
-            titleBounds.Width,
-            titleBounds.Height - topBounds.Height);
-        var viewportBounds = GraphicsDevice.Viewport.Bounds;
-        var previousScissor = GraphicsDevice.ScissorRectangle;
-
-        _spriteBatch.End();
-        GraphicsDevice.ScissorRectangle = Rectangle.Intersect(viewportBounds, topBounds);
-        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, rasterizerState: _canvasRasterizer);
-        DrawPixelText(_titleFont, title, position, PixologyPalette.TitleTopPink, StartScreenTextScale);
-        _spriteBatch.End();
-
-        GraphicsDevice.ScissorRectangle = Rectangle.Intersect(viewportBounds, bottomBounds);
-        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, rasterizerState: _canvasRasterizer);
-        DrawPixelText(_titleFont, title, position, PixologyPalette.TitleBottomPink, StartScreenTextScale);
-        _spriteBatch.End();
-
-        GraphicsDevice.ScissorRectangle = previousScissor;
-        _spriteBatch.Begin(samplerState: SamplerState.PointClamp);
-    }
-
-    private static void MakeFontPixelPerfect(SpriteFont font)
-    {
-        var texture = font.Texture;
-        var pixels = new byte[texture.Width * texture.Height];
-        texture.GetData(pixels);
-        for (var index = 0; index < pixels.Length; index++)
-            pixels[index] = pixels[index] >= 128 ? byte.MaxValue : byte.MinValue;
-
-        texture.SetData(pixels);
-    }
-
     private void DrawEditor(MouseState mouse)
     {
         var viewport = GraphicsDevice.Viewport;
@@ -823,65 +801,47 @@ public sealed class PixologyGame : Game
         var saveButton = new Rectangle(12, 8, 92, 40);
         DrawButton(saveButton, "Save", mouse);
 
-        DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), "Brush", EditorTool.Brush, mouse);
-        DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), "Erase", EditorTool.Erase, mouse);
-        DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), "Bucket", EditorTool.PaintBucket, mouse);
-        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Crop", EditorTool.Crop, mouse);
-        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), "Dropper", EditorTool.Eyedropper, mouse);
-        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), "Select", EditorTool.Select, mouse);
+        DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), "Select", EditorTool.Select, mouse);
+        DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), "Brush", EditorTool.Brush, mouse);
+        DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), "Erase", EditorTool.Erase, mouse);
+        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Bucket", EditorTool.PaintBucket, mouse);
+        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), "Crop", EditorTool.Crop, mouse);
+        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), "Dropper", EditorTool.Eyedropper, mouse);
 
         var checkbox = new Rectangle(124, 17, 22, 22);
-        DrawRectangle(checkbox, Color.White);
+        DrawRectangle(checkbox, _showGrid ? PixologyPalette.CheckboxChecked : Color.White);
         DrawOutline(checkbox, Color.Black, 2);
-        if (_showGrid)
-        {
-            DrawRectangle(new Rectangle(checkbox.X + 4, checkbox.Y + 10, 5, 4), Color.Black);
-            DrawRectangle(new Rectangle(checkbox.X + 8, checkbox.Y + 13, 4, 6), Color.Black);
-            DrawRectangle(new Rectangle(checkbox.X + 11, checkbox.Y + 8, 7, 4), Color.Black);
-            DrawRectangle(new Rectangle(checkbox.X + 15, checkbox.Y + 5, 4, 5), Color.Black);
-        }
 
         DrawPixelText("Show Grid", new Vector2(154, 17), Color.Black);
         if (_activeTool == EditorTool.PaintBucket)
         {
             var contiguousCheckbox = new Rectangle(278, 17, 22, 22);
-            DrawRectangle(contiguousCheckbox, Color.White);
+            DrawRectangle(contiguousCheckbox, _bucketContiguous ? PixologyPalette.CheckboxChecked : Color.White);
             DrawOutline(contiguousCheckbox, Color.Black, 2);
-            if (_bucketContiguous)
-            {
-                DrawRectangle(new Rectangle(contiguousCheckbox.X + 4, contiguousCheckbox.Y + 10, 5, 4), Color.Black);
-                DrawRectangle(new Rectangle(contiguousCheckbox.X + 8, contiguousCheckbox.Y + 13, 4, 6), Color.Black);
-                DrawRectangle(new Rectangle(contiguousCheckbox.X + 11, contiguousCheckbox.Y + 8, 7, 4), Color.Black);
-                DrawRectangle(new Rectangle(contiguousCheckbox.X + 15, contiguousCheckbox.Y + 5, 4, 5), Color.Black);
-            }
 
             DrawPixelText("Contiguous", new Vector2(308, 17), Color.Black);
         }
-        else if (_activeTool == EditorTool.Crop)
-        {
-            DrawPixelText("Drag crop edges (16px snap)", new Vector2(440, 17), Color.Black);
-        }
-        else if (_activeTool == EditorTool.Eyedropper)
-        {
-            DrawPixelText("Click a pixel to pick its color", new Vector2(440, 17), Color.Black);
-        }
-        else if (_activeTool == EditorTool.Select)
-        {
-            DrawPixelText("Drag selected layer pixels to move", new Vector2(440, 17), Color.Black);
-        }
-
         DrawColorPicker(rightSidebar);
         DrawLayersPanel(rightSidebar, mouse);
+        DrawEditorStatus();
 
-        if (_saveMessage.Length > 0)
-        {
-            var messageSize = _font.MeasureString(_saveMessage);
-            DrawPixelText(
-                _saveMessage,
-                new Vector2(viewport.Width - messageSize.X - 12, 17),
-                Color.Black);
-        }
+    }
 
+    private void DrawEditorStatus()
+    {
+        if (_saveMessage.Length == 0)
+            return;
+
+        var workspace = GetWorkspaceBounds(GraphicsDevice.Viewport);
+        var message = FitText(_saveMessage, workspace.Width - 32);
+        var messageBounds = new Rectangle(
+            workspace.X + 8,
+            workspace.Bottom - 30,
+            (int)_font.MeasureString(message).X + 16,
+            24);
+        DrawRectangle(messageBounds, Color.White);
+        DrawOutline(messageBounds, new Color(210, 210, 210), 1);
+        DrawPixelText(message, new Vector2(messageBounds.X + 8, messageBounds.Y + 4), Color.Black);
     }
 
     private void DrawCanvasArea(Point mousePosition)
@@ -947,7 +907,6 @@ public sealed class PixologyGame : Game
             (int)MathF.Round(canvasBounds.Y + _cropSelection.Y * pixelScale),
             (int)MathF.Round(_cropSelection.Width * pixelScale),
             (int)MathF.Round(_cropSelection.Height * pixelScale));
-        DrawRectangle(bounds, new Color(80, 140, 220, 35));
         DrawOutline(bounds, new Color(30, 90, 180), 2);
         const int handleSize = 8;
         var halfHandle = handleSize / 2;
@@ -1020,6 +979,7 @@ public sealed class PixologyGame : Game
         {
             _canvasWidth = InitialCanvasSize;
             _canvasHeight = InitialCanvasSize;
+            _canvasSaveFileName = "image";
             _canvasPixels = new Color[_canvasWidth * _canvasHeight];
             _layers.Clear();
             _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
@@ -1604,10 +1564,13 @@ public sealed class PixologyGame : Game
         if (pickerBounds.HexBounds.Contains(position))
         {
             _hexSelected = true;
+            _hexTextSelectionActive = true;
+            _hexEditText = GetSelectedHexColor()[1..];
             return;
         }
 
         _hexSelected = false;
+        _hexTextSelectionActive = false;
         if (pickerBounds.SaturationValue.Contains(position))
         {
             _colorPickerDrag = ColorPickerDrag.SaturationValue;
@@ -1627,37 +1590,37 @@ public sealed class PixologyGame : Game
 
         if (new Rectangle(8, 72, SidebarWidth - 16, 56).Contains(position))
         {
-            _activeTool = EditorTool.Brush;
+            ActivateSelectionTool();
             return;
         }
 
         if (new Rectangle(8, 136, SidebarWidth - 16, 56).Contains(position))
         {
-            _activeTool = EditorTool.Erase;
+            _activeTool = EditorTool.Brush;
             return;
         }
 
         if (new Rectangle(8, 200, SidebarWidth - 16, 56).Contains(position))
         {
-            _activeTool = EditorTool.PaintBucket;
+            _activeTool = EditorTool.Erase;
             return;
         }
 
         if (new Rectangle(8, 264, SidebarWidth - 16, 56).Contains(position))
         {
-            ActivateCropTool();
+            _activeTool = EditorTool.PaintBucket;
             return;
         }
 
         if (new Rectangle(8, 328, SidebarWidth - 16, 56).Contains(position))
         {
-            _activeTool = EditorTool.Eyedropper;
+            ActivateCropTool();
             return;
         }
 
         if (new Rectangle(8, 392, SidebarWidth - 16, 56).Contains(position))
         {
-            ActivateSelectionTool();
+            _activeTool = EditorTool.Eyedropper;
             return;
         }
 
@@ -1699,20 +1662,63 @@ public sealed class PixologyGame : Game
             var hex = clipboardText.Trim();
             if (hex.StartsWith('#'))
                 hex = hex[1..];
-
-            if (hex.Length != 6 || !uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rgb))
+            if (!TryApplyHexColor(hex))
             {
                 _saveMessage = "Clipboard text is not a #RRGGBB color";
                 return;
             }
 
-            _selectedColor = new Color(
-                (byte)(rgb >> 16),
-                (byte)(rgb >> 8),
-                (byte)rgb);
-            UpdateHsvFromSelectedColor();
-            _saveMessage = $"Selected {GetSelectedHexColor()}";
+            EditHexText(hex);
         }
+    }
+
+    private void HandleTextInput(object sender, TextInputEventArgs eventArgs)
+    {
+        if (!_hexSelected ||
+            !char.IsAsciiHexDigit(eventArgs.Character) ||
+            (_hexEditText.Length >= 6 && !_hexTextSelectionActive))
+            return;
+
+        EditHexText(char.ToUpperInvariant(eventArgs.Character).ToString());
+    }
+
+    private void EditHexText(string text, bool backspace = false)
+    {
+        if (_hexTextSelectionActive)
+        {
+            _hexEditText = string.Empty;
+            _hexTextSelectionActive = false;
+        }
+
+        if (backspace)
+        {
+            if (_hexEditText.Length > 0)
+                _hexEditText = _hexEditText[..^1];
+            return;
+        }
+
+        if (_hexEditText.Length + text.Length > 6)
+            return;
+
+        _hexEditText += text;
+        if (_hexEditText.Length == 6)
+            TryApplyHexColor(_hexEditText);
+    }
+
+    private bool TryApplyHexColor(string hex)
+    {
+        if (hex.Length != 6 ||
+            !uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rgb))
+        {
+            return false;
+        }
+
+        _selectedColor = new Color(
+            (byte)(rgb >> 16),
+            (byte)(rgb >> 8),
+            (byte)rgb);
+        UpdateHsvFromSelectedColor();
+        return true;
     }
 
     private string GetSelectedHexColor()
@@ -1863,11 +1869,12 @@ public sealed class PixologyGame : Game
     private void SaveCanvas()
     {
         var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        var filePath = Path.Combine(desktopPath, "image.png");
+        var fileName = string.IsNullOrWhiteSpace(_canvasSaveFileName) ? "image" : _canvasSaveFileName;
+        var filePath = Path.Combine(desktopPath, $"{fileName}.png");
         using var stream = File.Create(filePath);
         RefreshCompositeTexture();
         _canvas.SaveAsPng(stream, _canvasWidth, _canvasHeight);
-        _saveMessage = "Saved image.png to Desktop";
+        _saveMessage = $"Saved {fileName}.png to Desktop";
     }
 
     private void HandleScroll(MouseState mouse)
@@ -1939,7 +1946,9 @@ public sealed class PixologyGame : Game
         DrawOutline(new Rectangle(selectedX - 5, selectedY - 5, 11, 11), Color.White, 2);
         DrawOutline(new Rectangle(selectedX - 2, selectedY - 2, 5, 5), Color.Black, 1);
 
-        var hexColor = GetSelectedHexColor();
+        var hexColor = _hexSelected
+            ? $"#{_hexEditText}{(_hexEditText.Length < 6 ? "_" : string.Empty)}"
+            : GetSelectedHexColor();
         DrawRectangle(bounds.HexBounds, _hexSelected ? new Color(50, 100, 170) : Color.White);
         DrawOutline(bounds.HexBounds, Color.Black, 1);
         DrawPixelText(hexColor, bounds.HexPosition, _hexSelected ? Color.White : Color.Black);
@@ -2022,9 +2031,9 @@ public sealed class PixologyGame : Game
             Math.Max(0, GetAddLayerButtonBounds(panel).Y - top - 8));
     }
 
-    private static Rectangle GetLayerContextMenuBounds(Point position)
+    private static Rectangle GetLayerContextMenuBounds(Point position, int itemCount)
     {
-        return new Rectangle(position.X, position.Y, 140, 84);
+        return new Rectangle(position.X, position.Y, 140, itemCount * 27 + 2);
     }
 
     private bool HandleLayerPanelClick(Point position)
@@ -2032,18 +2041,27 @@ public sealed class PixologyGame : Game
         var panel = GetLayersPanelBounds(GetRightSidebarBounds(GraphicsDevice.Viewport));
         if (_isLayerContextMenuOpen)
         {
-            var menu = GetLayerContextMenuBounds(_layerContextMenuPosition);
+            var menuItems = GetLayerContextMenuItems(_contextMenuLayerIndex);
+            var menu = GetLayerContextMenuBounds(_layerContextMenuPosition, menuItems.Length);
             if (menu.Contains(position))
             {
-                var action = (position.Y - menu.Y) / 28;
-                var layerIndex = _contextMenuLayerIndex;
+                var itemIndex = (position.Y - menu.Y - 1) / 27;
                 _isLayerContextMenuOpen = false;
-                if (action == 0)
-                    MergeLayer(layerIndex, 1);
-                else if (action == 1)
-                    MergeLayer(layerIndex, -1);
-                else if (action == 2)
-                    DeleteLayer(layerIndex);
+                if (itemIndex >= 0 && itemIndex < menuItems.Length && menuItems[itemIndex].Enabled)
+                {
+                    switch (menuItems[itemIndex].Action)
+                    {
+                        case LayerContextMenuAction.MergeUp:
+                            MergeLayer(_contextMenuLayerIndex, 1);
+                            break;
+                        case LayerContextMenuAction.MergeDown:
+                            MergeLayer(_contextMenuLayerIndex, -1);
+                            break;
+                        case LayerContextMenuAction.Delete:
+                            DeleteLayer(_contextMenuLayerIndex);
+                            break;
+                    }
+                }
 
                 return true;
             }
@@ -2108,10 +2126,9 @@ public sealed class PixologyGame : Game
         }
 
         SelectLayer(layerIndex);
-        var menuWidth = 140;
-        var menuHeight = 84;
+        var menuHeight = GetLayerContextMenuItems(layerIndex).Length * 27 + 2;
         _layerContextMenuPosition = new Point(
-            Math.Clamp(position.X, panel.X, Math.Max(panel.X, panel.Right - menuWidth)),
+            Math.Clamp(position.X, panel.X, Math.Max(panel.X, panel.Right - 140)),
             Math.Clamp(position.Y, panel.Y, Math.Max(panel.Y, panel.Bottom - menuHeight)));
         _contextMenuLayerIndex = layerIndex;
         _isLayerContextMenuOpen = true;
@@ -2120,28 +2137,39 @@ public sealed class PixologyGame : Game
 
     private void DrawLayerContextMenu(MouseState mouse)
     {
-        var menu = GetLayerContextMenuBounds(_layerContextMenuPosition);
+        var items = GetLayerContextMenuItems(_contextMenuLayerIndex);
+        var menu = GetLayerContextMenuBounds(_layerContextMenuPosition, items.Length);
         DrawRectangle(menu, Color.White);
         DrawOutline(menu, Color.Black, 1);
-        var layerIndex = _contextMenuLayerIndex;
-        var canMergeUp = layerIndex >= 0 && layerIndex < _layers.Count - 1;
-        var canMergeDown = layerIndex > 0 && layerIndex < _layers.Count;
-        var canDelete = _layers.Count > 1;
-        DrawLayerContextMenuItem(menu, 0, "Merge Up", canMergeUp, mouse);
-        DrawLayerContextMenuItem(menu, 1, "Merge Down", canMergeDown, mouse);
-        DrawLayerContextMenuItem(menu, 2, "Delete", canDelete, mouse);
+        for (var index = 0; index < items.Length; index++)
+            DrawLayerContextMenuItem(menu, index, items[index], mouse);
     }
 
-    private void DrawLayerContextMenuItem(Rectangle menu, int item, string label, bool enabled, MouseState mouse)
+    private LayerContextMenuItem[] GetLayerContextMenuItems(int layerIndex)
+    {
+        var items = new List<LayerContextMenuItem>(3);
+        if (layerIndex >= 0 && layerIndex < _layers.Count - 1)
+            items.Add(new LayerContextMenuItem("Merge Up", LayerContextMenuAction.MergeUp, true));
+        if (layerIndex > 0 && layerIndex < _layers.Count)
+            items.Add(new LayerContextMenuItem("Merge Down", LayerContextMenuAction.MergeDown, true));
+        items.Add(new LayerContextMenuItem("Delete", LayerContextMenuAction.Delete, _layers.Count > 1));
+        return items.ToArray();
+    }
+
+    private void DrawLayerContextMenuItem(
+        Rectangle menu,
+        int item,
+        LayerContextMenuItem menuItem,
+        MouseState mouse)
     {
         var bounds = new Rectangle(menu.X + 1, menu.Y + 1 + item * 27, menu.Width - 2, 27);
-        if (enabled && bounds.Contains(mouse.Position))
+        if (menuItem.Enabled && bounds.Contains(mouse.Position))
             DrawRectangle(bounds, new Color(220, 232, 248));
 
         DrawPixelText(
-            label,
+            menuItem.Label,
             new Vector2(bounds.X + 8, bounds.Y + 6),
-            enabled ? Color.Black : new Color(145, 145, 145));
+            menuItem.Enabled ? Color.Black : new Color(145, 145, 145));
     }
 
     private void SelectLayer(int layerIndex)
@@ -2373,8 +2401,6 @@ public sealed class PixologyGame : Game
         var fitScale = Math.Max(1, Math.Min(
             (workspace.Width - 64) / _canvasWidth,
             (workspace.Height - 64) / _canvasHeight));
-        if (_activeTool == EditorTool.Crop)
-            fitScale = Math.Max(1, fitScale / 2);
         var pixelScale = Math.Max(1, (int)MathF.Round(fitScale * _zoom));
         var width = _canvasWidth * pixelScale;
         var height = _canvasHeight * pixelScale;
