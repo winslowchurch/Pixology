@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -48,6 +49,7 @@ public sealed class PixologyGame : Game
     }
 
     private sealed record CanvasSnapshot(int Width, int Height, Color[] Pixels);
+    private sealed record OpenFileEntry(string Name, string Path, bool IsDirectory);
 
     private enum ColorPickerDrag
     {
@@ -79,6 +81,7 @@ public sealed class PixologyGame : Game
     private bool _isCropping;
     private bool _cropSelectionInitialized;
     private bool _hexSelected;
+    private bool _showOpenFileDialog;
     private EditorTool _activeTool;
     private ColorPickerDrag _colorPickerDrag;
     private float _selectedHue;
@@ -90,6 +93,11 @@ public sealed class PixologyGame : Game
     private Rectangle _cropSelection;
     private Rectangle _cropDragSelection;
     private CropDragMode _cropDragMode;
+    private readonly List<OpenFileEntry> _openFileEntries = new();
+    private string _openDirectory = string.Empty;
+    private string _openFileMessage = string.Empty;
+    private int _selectedOpenFileEntry = -1;
+    private int _openFileListOffset;
     private Vector2 _canvasPan;
     private float _zoom = 1f;
     private MacTrackpadPinch _trackpadPinch = null!;
@@ -137,7 +145,7 @@ public sealed class PixologyGame : Game
     protected override void Update(GameTime gameTime)
     {
         var keyboard = Keyboard.GetState();
-        if (keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape) &&
+        if (!_showOpenFileDialog && keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape) &&
             _graphics.IsFullScreen)
         {
             _graphics.IsFullScreen = false;
@@ -186,6 +194,15 @@ public sealed class PixologyGame : Game
         var spacePressed = keyboard.IsKeyDown(Keys.Space);
         var justPressedLeft = leftPressed && _previousMouse.LeftButton == ButtonState.Released;
         var justPressedMiddle = middlePressed && _previousMouse.MiddleButton == ButtonState.Released;
+
+        if (_showOpenFileDialog)
+        {
+            UpdateOpenFileDialog(mouse, keyboard, justPressedLeft);
+            _previousMouse = mouse;
+            _previousKeyboard = keyboard;
+            base.Update(gameTime);
+            return;
+        }
 
         if (_isEditing && (mouse.ScrollWheelValue != _previousMouse.ScrollWheelValue ||
                            mouse.HorizontalScrollWheelValue != _previousMouse.HorizontalScrollWheelValue))
@@ -271,6 +288,8 @@ public sealed class PixologyGame : Game
         {
             _spriteBatch.Begin(samplerState: SamplerState.PointClamp);
             DrawStartScreen(mouse);
+            if (_showOpenFileDialog)
+                DrawOpenFileDialog(mouse);
             _spriteBatch.End();
         }
 
@@ -297,6 +316,293 @@ public sealed class PixologyGame : Game
 
         DrawButton(firstButton, "New", mouse, StartScreenButtonTextScale);
         DrawButton(secondButton, "Open File", mouse, StartScreenButtonTextScale);
+    }
+
+    private void DrawOpenFileDialog(MouseState mouse)
+    {
+        var dialog = GetOpenFileDialogBounds();
+        DrawRectangle(dialog, new Color(246, 246, 246));
+        DrawOutline(dialog, Color.Black, 2);
+        DrawPixelText("Select an image", new Vector2(dialog.X + 16, dialog.Y + 12), Color.Black);
+        DrawPixelText(
+            FitText(_openDirectory, dialog.Width - 32),
+            new Vector2(dialog.X + 16, dialog.Y + 40),
+            Color.Black);
+
+        var upButton = new Rectangle(dialog.X + 16, dialog.Y + 66, 76, 30);
+        var homeButton = new Rectangle(upButton.Right + 8, upButton.Y, 84, 30);
+        DrawButton(upButton, "Up", mouse);
+        DrawButton(homeButton, "Home", mouse);
+
+        var listBounds = GetOpenFileListBounds(dialog);
+        DrawRectangle(listBounds, Color.White);
+        DrawOutline(listBounds, Color.Black, 1);
+        const int rowHeight = 24;
+        var visibleCount = Math.Max(0, listBounds.Height / rowHeight);
+        for (var row = 0; row < visibleCount; row++)
+        {
+            var entryIndex = _openFileListOffset + row;
+            if (entryIndex >= _openFileEntries.Count)
+                break;
+
+            var rowBounds = new Rectangle(
+                listBounds.X + 1,
+                listBounds.Y + 1 + row * rowHeight,
+                listBounds.Width - 2,
+                rowHeight);
+            if (entryIndex == _selectedOpenFileEntry)
+                DrawRectangle(rowBounds, new Color(190, 215, 245));
+
+            var entry = _openFileEntries[entryIndex];
+            var label = entry.IsDirectory ? $"[Folder] {entry.Name}" : entry.Name;
+            DrawPixelText(FitText(label, rowBounds.Width - 12), new Vector2(rowBounds.X + 6, rowBounds.Y + 3), Color.Black);
+        }
+
+        if (_openFileMessage.Length > 0)
+            DrawPixelText(FitText(_openFileMessage, dialog.Width - 32), new Vector2(dialog.X + 16, listBounds.Bottom + 3), Color.DarkRed);
+
+        var buttonY = dialog.Bottom - 44;
+        var openButton = new Rectangle(dialog.Right - 216, buttonY, 92, 32);
+        var cancelButton = new Rectangle(dialog.Right - 112, buttonY, 96, 32);
+        DrawButton(openButton, "Open", mouse);
+        DrawButton(cancelButton, "Cancel", mouse);
+    }
+
+    private void UpdateOpenFileDialog(MouseState mouse, KeyboardState keyboard, bool justPressedLeft)
+    {
+        if (keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape))
+        {
+            _showOpenFileDialog = false;
+            return;
+        }
+
+        if (keyboard.IsKeyDown(Keys.Back) && !_previousKeyboard.IsKeyDown(Keys.Back))
+            NavigateToParentDirectory();
+
+        if (keyboard.IsKeyDown(Keys.Up) && !_previousKeyboard.IsKeyDown(Keys.Up))
+            SelectOpenFileEntry(Math.Max(0, _selectedOpenFileEntry - 1));
+        else if (keyboard.IsKeyDown(Keys.Down) && !_previousKeyboard.IsKeyDown(Keys.Down))
+            SelectOpenFileEntry(Math.Min(_openFileEntries.Count - 1, _selectedOpenFileEntry + 1));
+        else if (keyboard.IsKeyDown(Keys.Enter) && !_previousKeyboard.IsKeyDown(Keys.Enter))
+            OpenSelectedFileEntry();
+
+        if (mouse.ScrollWheelValue != _previousMouse.ScrollWheelValue)
+        {
+            var scrollDirection = Math.Sign(_previousMouse.ScrollWheelValue - mouse.ScrollWheelValue);
+            SetOpenFileListOffset(_openFileListOffset + scrollDirection);
+        }
+
+        if (!justPressedLeft)
+            return;
+
+        var dialog = GetOpenFileDialogBounds();
+        var upButton = new Rectangle(dialog.X + 16, dialog.Y + 66, 76, 30);
+        var homeButton = new Rectangle(upButton.Right + 8, upButton.Y, 84, 30);
+        if (upButton.Contains(mouse.Position))
+        {
+            NavigateToParentDirectory();
+            return;
+        }
+
+        if (homeButton.Contains(mouse.Position))
+        {
+            NavigateToHomeDirectory();
+            return;
+        }
+
+        var listBounds = GetOpenFileListBounds(dialog);
+        if (listBounds.Contains(mouse.Position))
+        {
+            const int rowHeight = 24;
+            var row = (mouse.Y - listBounds.Y - 1) / rowHeight;
+            var entryIndex = _openFileListOffset + row;
+            if (row >= 0 && entryIndex < _openFileEntries.Count)
+                SelectOpenFileEntry(entryIndex);
+            return;
+        }
+
+        var buttonY = dialog.Bottom - 44;
+        if (new Rectangle(dialog.Right - 216, buttonY, 92, 32).Contains(mouse.Position))
+            OpenSelectedFileEntry();
+        else if (new Rectangle(dialog.Right - 112, buttonY, 96, 32).Contains(mouse.Position))
+            _showOpenFileDialog = false;
+    }
+
+    private void ShowOpenFileDialog()
+    {
+        var picturesDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+        _openDirectory = Directory.Exists(picturesDirectory)
+            ? picturesDirectory
+            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        _selectedOpenFileEntry = -1;
+        _openFileListOffset = 0;
+        _openFileMessage = string.Empty;
+        _showOpenFileDialog = true;
+        RefreshOpenFileEntries();
+    }
+
+    private void RefreshOpenFileEntries()
+    {
+        _openFileEntries.Clear();
+        _selectedOpenFileEntry = -1;
+        _openFileListOffset = 0;
+        try
+        {
+            var directories = Directory.GetDirectories(_openDirectory)
+                .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase);
+            _openFileEntries.AddRange(directories.Select(path =>
+                new OpenFileEntry(Path.GetFileName(path), path, true)));
+
+            var files = Directory.GetFiles(_openDirectory)
+                .Where(IsSupportedImageFile)
+                .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase);
+            _openFileEntries.AddRange(files.Select(path =>
+                new OpenFileEntry(Path.GetFileName(path), path, false)));
+
+            _openFileMessage = _openFileEntries.Count == 0 ? "No supported images in this folder." : string.Empty;
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            _openFileMessage = $"Cannot access folder: {exception.Message}";
+        }
+        catch (IOException exception)
+        {
+            _openFileMessage = $"Cannot list folder: {exception.Message}";
+        }
+    }
+
+    private static bool IsSupportedImageFile(string path)
+    {
+        return Path.GetExtension(path).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg" or ".bmp";
+    }
+
+    private void SelectOpenFileEntry(int index)
+    {
+        if (_openFileEntries.Count == 0)
+        {
+            _selectedOpenFileEntry = -1;
+            return;
+        }
+
+        _selectedOpenFileEntry = Math.Clamp(index, 0, _openFileEntries.Count - 1);
+        var visibleRows = Math.Max(1, GetOpenFileListBounds(GetOpenFileDialogBounds()).Height / 24);
+        if (_selectedOpenFileEntry < _openFileListOffset)
+            _openFileListOffset = _selectedOpenFileEntry;
+        else if (_selectedOpenFileEntry >= _openFileListOffset + visibleRows)
+            _openFileListOffset = _selectedOpenFileEntry - visibleRows + 1;
+    }
+
+    private void SetOpenFileListOffset(int offset)
+    {
+        var visibleRows = Math.Max(1, GetOpenFileListBounds(GetOpenFileDialogBounds()).Height / 24);
+        _openFileListOffset = Math.Clamp(offset, 0, Math.Max(0, _openFileEntries.Count - visibleRows));
+    }
+
+    private void OpenSelectedFileEntry()
+    {
+        if (_selectedOpenFileEntry < 0 || _selectedOpenFileEntry >= _openFileEntries.Count)
+        {
+            _openFileMessage = "Select an image or folder first.";
+            return;
+        }
+
+        var entry = _openFileEntries[_selectedOpenFileEntry];
+        if (entry.IsDirectory)
+        {
+            _openDirectory = entry.Path;
+            RefreshOpenFileEntries();
+            return;
+        }
+
+        LoadImageFile(entry.Path);
+    }
+
+    private void NavigateToParentDirectory()
+    {
+        var parent = Directory.GetParent(_openDirectory);
+        if (parent is null)
+            return;
+
+        _openDirectory = parent.FullName;
+        RefreshOpenFileEntries();
+    }
+
+    private void NavigateToHomeDirectory()
+    {
+        _openDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        RefreshOpenFileEntries();
+    }
+
+    private void LoadImageFile(string path)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            using var image = Texture2D.FromStream(GraphicsDevice, stream);
+            if (image.Width <= 0 || image.Height <= 0 || image.Width > 4096 || image.Height > 4096)
+            {
+                _openFileMessage = "Image dimensions must be between 1 and 4096 pixels.";
+                return;
+            }
+
+            var pixels = new Color[image.Width * image.Height];
+            image.GetData(pixels);
+            _canvasWidth = image.Width;
+            _canvasHeight = image.Height;
+            _canvasPixels = pixels;
+            RebuildCanvasTextures();
+            _undoHistory.Clear();
+            _activeTool = EditorTool.Brush;
+            _cropSelectionInitialized = false;
+            _showGrid = false;
+            _canvasPan = Vector2.Zero;
+            _zoom = 1f;
+            _saveMessage = string.Empty;
+            _isEditing = true;
+            _showOpenFileDialog = false;
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            _openFileMessage = $"Cannot open image: {exception.Message}";
+        }
+        catch (IOException exception)
+        {
+            _openFileMessage = $"Cannot open image: {exception.Message}";
+        }
+        catch (InvalidOperationException exception)
+        {
+            _openFileMessage = $"Unsupported or invalid image: {exception.Message}";
+        }
+        catch (ArgumentException exception)
+        {
+            _openFileMessage = $"Unsupported or invalid image: {exception.Message}";
+        }
+    }
+
+    private Rectangle GetOpenFileDialogBounds()
+    {
+        var viewport = GraphicsDevice.Viewport;
+        var width = Math.Min(600, Math.Max(360, viewport.Width - 32));
+        var height = Math.Min(500, Math.Max(360, viewport.Height - 32));
+        return new Rectangle((viewport.Width - width) / 2, (viewport.Height - height) / 2, width, height);
+    }
+
+    private static Rectangle GetOpenFileListBounds(Rectangle dialog)
+    {
+        var buttonY = dialog.Bottom - 44;
+        return new Rectangle(dialog.X + 16, dialog.Y + 106, dialog.Width - 32, Math.Max(80, buttonY - (dialog.Y + 134)));
+    }
+
+    private string FitText(string text, int maxWidth)
+    {
+        if (_font.MeasureString(text).X <= maxWidth)
+            return text;
+
+        const string ellipsis = "...";
+        var length = text.Length;
+        while (length > 0 && _font.MeasureString(text[..length] + ellipsis).X > maxWidth)
+            length--;
+        return length == 0 ? ellipsis : text[..length] + ellipsis;
     }
 
     private void DrawTwoToneTitle(string title, Vector2 position, Vector2 size)
@@ -527,7 +833,13 @@ public sealed class PixologyGame : Game
             _zoom = 1f;
             _saveMessage = string.Empty;
             _isEditing = true;
+            return;
         }
+
+        var secondButton = firstButton;
+        secondButton.X += ButtonWidth + ButtonGap;
+        if (secondButton.Contains(position))
+            ShowOpenFileDialog();
     }
 
     private void BeginStroke()
