@@ -12,15 +12,14 @@ namespace Pixology;
 
 public sealed class PixologyGame : Game
 {
-    private const int ButtonWidth = 220;
-    private const int ButtonHeight = 64;
-    private const int ButtonGap = 24;
-    private const int StartScreenVerticalOffset = 36;
     private const int LayerContextMenuWidth = 176;
     private const int LayerContextMenuItemHeight = 34;
+    private const int TabContextMenuWidth = 160;
+    private const int TabContextMenuHeight = 38;
     private const int InitialCanvasSize = 32;
     private const int CropSnapSize = 16;
-    private const int ToolbarHeight = 56;
+    private const int ToolbarHeight = 88;
+    private const int TabStripHeight = 32;
     private const int SidebarWidth = 104;
     private const int RightSidebarWidth = 224;
     private const float MinimumZoom = 0.25f;
@@ -64,6 +63,26 @@ public sealed class PixologyGame : Game
         public float Opacity { get; set; } = 1f;
     }
 
+    private sealed class Document
+    {
+        public string Title = string.Empty;
+        public string FilePath = string.Empty;
+        public int Width;
+        public int Height;
+        public List<Layer> Layers = new();
+        public Stack<CanvasSnapshot> UndoHistory = new();
+        public int ActiveLayerIndex;
+        public int LayerListOffset;
+        public Rectangle SelectionBounds;
+        public bool ShowGrid;
+        public Rectangle CropSelection;
+        public bool CropSelectionInitialized;
+        public Vector2 CanvasPan;
+        public float Zoom = 1f;
+        public string SaveFileName = "image";
+        public string SaveMessage = string.Empty;
+    }
+
     private sealed record LayerSnapshot(string Name, float Opacity, Color[] Pixels);
     private sealed record LayerContextMenuItem(string Label, LayerContextMenuAction Action, bool Enabled);
     private sealed record CanvasSnapshot(
@@ -84,11 +103,13 @@ public sealed class PixologyGame : Game
     }
 
     private readonly GraphicsDeviceManager _graphics;
-    private readonly Stack<CanvasSnapshot> _undoHistory = new();
-    private readonly List<Layer> _layers = new();
+    private Stack<CanvasSnapshot> _undoHistory = new();
+    private List<Layer> _layers = new();
+    private readonly List<Document> _documents = new();
+    private int _activeDocumentIndex = -1;
+    private int _firstVisibleTabIndex;
     private SpriteBatch _spriteBatch = null!;
     private SpriteFont _font = null!;
-    private SpriteFont _titleFont = null!;
     private Texture2D _pixel = null!;
     private Texture2D _toolIcons = null!;
     private Texture2D _canvas = null!;
@@ -113,6 +134,7 @@ public sealed class PixologyGame : Game
     private bool _hexTextSelectionActive;
     private string _hexEditText = string.Empty;
     private bool _showOpenFileDialog;
+    private bool _openFileCreatesTab;
     private EditorTool _activeTool;
     private ColorPickerDrag _colorPickerDrag;
     private float _selectedHue;
@@ -150,6 +172,9 @@ public sealed class PixologyGame : Game
     private Point _layerContextMenuPosition;
     private int _contextMenuLayerIndex = -1;
     private bool _isLayerContextMenuOpen;
+    private bool _isTabContextMenuOpen;
+    private int _contextMenuDocumentIndex = -1;
+    private Point _tabContextMenuPosition;
     private bool _isDraggingLayer;
     private int _draggedLayerIndex = -1;
     private int _layerDropTargetIndex = -1;
@@ -182,18 +207,15 @@ public sealed class PixologyGame : Game
     {
         _spriteBatch = new SpriteBatch(GraphicsDevice);
         _font = Content.Load<SpriteFont>("AliceFont");
-        _titleFont = Content.Load<SpriteFont>("AliceTitle");
         _canvasRasterizer = new RasterizerState { ScissorTestEnable = true };
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
         _toolIcons = Content.Load<Texture2D>("ui");
-        _canvasPixels = new Color[_canvasWidth * _canvasHeight];
-        _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
-        RebuildCanvasTextures();
         _saturationValueTexture = new Texture2D(GraphicsDevice, 144, 144);
         _hueTexture = new Texture2D(GraphicsDevice, 20, 144);
         UpdateSaturationValueTexture();
         UpdateHueTexture();
+        CreateNewDocument();
         if (OperatingSystem.IsMacOS())
         {
             _trackpadPinch = new MacTrackpadPinch(HandleTrackpadMagnification);
@@ -205,9 +227,10 @@ public sealed class PixologyGame : Game
     {
         var keyboard = Keyboard.GetState();
         if (!_showOpenFileDialog && keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape) &&
-            _graphics.IsFullScreen)
+            (_graphics.IsFullScreen || GraphicsDevice.PresentationParameters.IsFullScreen || Window.IsBorderless))
         {
             _graphics.IsFullScreen = false;
+            Window.IsBorderless = false;
             _graphics.ApplyChanges();
         }
 
@@ -220,6 +243,15 @@ public sealed class PixologyGame : Game
                 keyboard.IsKeyDown(Keys.RightControl) ||
                 keyboard.IsKeyDown(Keys.LeftWindows) ||
                 keyboard.IsKeyDown(Keys.RightWindows);
+
+            var controlDown = keyboard.IsKeyDown(Keys.LeftControl) || keyboard.IsKeyDown(Keys.RightControl);
+            if (controlDown && keyboard.IsKeyDown(Keys.Tab) && !_previousKeyboard.IsKeyDown(Keys.Tab) &&
+                _documents.Count > 1)
+            {
+                var backwards = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
+                var nextIndex = (_activeDocumentIndex + (backwards ? _documents.Count - 1 : 1)) % _documents.Count;
+                ActivateDocument(nextIndex);
+            }
 
             if (!_hexSelected && !commandOrControlDown && keyboard.IsKeyDown(Keys.B))
                 _activeTool = EditorTool.Brush;
@@ -294,8 +326,32 @@ public sealed class PixologyGame : Game
             return;
         }
 
+        if (_isEditing && justPressedLeft && _isTabContextMenuOpen && HandleTabContextMenuClick(mouse.Position))
+        {
+            _previousMouse = mouse;
+            _previousKeyboard = keyboard;
+            base.Update(gameTime);
+            return;
+        }
+
+        if (_isEditing && justPressedLeft && mouse.Y < TabStripHeight && HandleTabStripClick(mouse.Position))
+        {
+            _previousMouse = mouse;
+            _previousKeyboard = keyboard;
+            base.Update(gameTime);
+            return;
+        }
+
         if (_isEditing && justPressedRight)
-            HandleLayerPanelRightClick(mouse.Position);
+        {
+            if (HandleTabContextMenuRightClick(mouse.Position))
+                _isLayerContextMenuOpen = false;
+            else
+            {
+                _isTabContextMenuOpen = false;
+                HandleLayerPanelRightClick(mouse.Position);
+            }
+        }
 
         if (_isAdjustingLayerOpacity && leftPressed)
             UpdateLayerOpacity(mouse.Position);
@@ -339,9 +395,6 @@ public sealed class PixologyGame : Game
             else if (_activeTool != EditorTool.Crop && IsInsideCanvas(mouse.Position))
                 BeginStroke();
         }
-        else if (!_isEditing && justPressedLeft)
-            HandleStartScreenClick(mouse.Position);
-
         if (_isEditing && _isPanning &&
             (middlePressed || (leftPressed && spacePressed)) &&
             !justPressedMiddle &&
@@ -412,39 +465,14 @@ public sealed class PixologyGame : Game
             DrawCanvasArea(mouse.Position);
             _spriteBatch.End();
             GraphicsDevice.ScissorRectangle = GraphicsDevice.Viewport.Bounds;
-        }
-        else
-        {
-            _spriteBatch.Begin(samplerState: SamplerState.LinearClamp);
-            DrawStartScreen(mouse);
             if (_showOpenFileDialog)
+            {
+                _spriteBatch.Begin(samplerState: SamplerState.LinearClamp);
                 DrawOpenFileDialog(mouse);
-            _spriteBatch.End();
+                _spriteBatch.End();
+            }
         }
-
         base.Draw(gameTime);
-    }
-
-    private void DrawStartScreen(MouseState mouse)
-    {
-        var viewport = GraphicsDevice.Viewport;
-        var firstButton = new Rectangle(
-            (viewport.Width - (ButtonWidth * 2 + ButtonGap)) / 2,
-            (viewport.Height - ButtonHeight) / 2 + StartScreenVerticalOffset,
-            ButtonWidth,
-            ButtonHeight);
-        var secondButton = firstButton;
-        secondButton.X += ButtonWidth + ButtonGap;
-
-        const string title = "Pixology";
-        var titleSize = _titleFont.MeasureString(title);
-        var titlePosition = new Vector2(
-            MathF.Round((viewport.Width - titleSize.X) / 2),
-            MathF.Round(firstButton.Y - titleSize.Y - 8));
-        DrawPixelText(_titleFont, title, titlePosition, PixologyPalette.TitleText);
-
-        DrawButton(firstButton, "New", mouse, 1.15f, prominent: true);
-        DrawButton(secondButton, "Open File", mouse, 1.15f, prominent: true);
     }
 
     private void UpdateMouseCursor(Point position)
@@ -455,11 +483,10 @@ public sealed class PixologyGame : Game
             var dialog = GetOpenFileDialogBounds();
             var upButton = new Rectangle(dialog.X + 16, dialog.Y + 66, 76, 30);
             var homeButton = new Rectangle(upButton.Right + 8, upButton.Y, 84, 30);
-            var buttonY = dialog.Bottom - 44;
+            var (openButton, cancelButton) = GetOpenFileDialogButtons(dialog);
             var listBounds = GetOpenFileListBounds(dialog);
             if (upButton.Contains(position) || homeButton.Contains(position) ||
-                new Rectangle(dialog.Right - 216, buttonY, 92, 32).Contains(position) ||
-                new Rectangle(dialog.Right - 112, buttonY, 96, 32).Contains(position))
+                openButton.Contains(position) || cancelButton.Contains(position))
                 cursor = MouseCursor.Hand;
             else if (listBounds.Contains(position))
             {
@@ -478,15 +505,19 @@ public sealed class PixologyGame : Game
             {
                 var sidebar = GetRightSidebarBounds(GraphicsDevice.Viewport);
                 var layers = GetLayersPanelBounds(sidebar);
+                var tabLayout = GetTabStripLayout();
+                var onTab = tabLayout.NewButton.Contains(position) || tabLayout.OpenButton.Contains(position) ||
+                            tabLayout.Tabs.Any(bounds => bounds.Contains(position)) ||
+                            (_isTabContextMenuOpen && GetTabContextMenuBounds().Contains(position));
                 var toolButtons = Enumerable.Range(0, 6)
-                    .Select(index => new Rectangle(8, 72 + index * 64, SidebarWidth - 16, 56));
-                var toolbarControl = new Rectangle(124, 14, 160, 28).Contains(position) ||
-                                     new Rectangle(312, 14, 172, 28).Contains(position);
+                    .Select(index => new Rectangle(8, 104 + index * 64, SidebarWidth - 16, 56));
+                var toolbarControl = new Rectangle(124, 46, 160, 28).Contains(position) ||
+                                     new Rectangle(312, 46, 172, 28).Contains(position);
                 var layerRows = GetLayerListBounds(layers).Contains(position);
                 var menu = _isLayerContextMenuOpen &&
                            GetLayerContextMenuBounds(_layerContextMenuPosition,
                                GetLayerContextMenuItems(_contextMenuLayerIndex).Length).Contains(position);
-                if (new Rectangle(12, 8, 92, 40).Contains(position) ||
+                if (onTab || new Rectangle(12, 40, 92, 40).Contains(position) ||
                     toolButtons.Any(bounds => bounds.Contains(position)) || toolbarControl ||
                     picker.HexBounds.Contains(position) || picker.SaturationValue.Contains(position) ||
                     picker.Hue.Contains(position) || GetLayerOpacityBounds(layers).Contains(position) ||
@@ -494,17 +525,6 @@ public sealed class PixologyGame : Game
                     cursor = MouseCursor.Hand;
             }
         }
-        else if (!_showOpenFileDialog)
-        {
-            var viewport = GraphicsDevice.Viewport;
-            var y = (viewport.Height - ButtonHeight) / 2;
-            y += StartScreenVerticalOffset;
-            var first = new Rectangle((viewport.Width - (ButtonWidth * 2 + ButtonGap)) / 2, y, ButtonWidth, ButtonHeight);
-            var second = new Rectangle(first.Right + ButtonGap, y, ButtonWidth, ButtonHeight);
-            if (first.Contains(position) || second.Contains(position))
-                cursor = MouseCursor.Hand;
-        }
-
         Mouse.SetCursor(cursor);
     }
 
@@ -557,9 +577,7 @@ public sealed class PixologyGame : Game
         if (_openFileMessage.Length > 0)
             DrawPixelText(FitText(_openFileMessage, dialog.Width - 32), new Vector2(dialog.X + 16, listBounds.Bottom + 3), PixologyPalette.Ink);
 
-        var buttonY = dialog.Bottom - 44;
-        var openButton = new Rectangle(dialog.Right - 216, buttonY, 92, 32);
-        var cancelButton = new Rectangle(dialog.Right - 112, buttonY, 96, 32);
+        var (openButton, cancelButton) = GetOpenFileDialogButtons(dialog);
         DrawButton(openButton, "Open", mouse);
         DrawButton(cancelButton, "Cancel", mouse);
     }
@@ -573,6 +591,7 @@ public sealed class PixologyGame : Game
         if (keyboard.IsKeyDown(Keys.Escape) && !_previousKeyboard.IsKeyDown(Keys.Escape))
         {
             _showOpenFileDialog = false;
+            _openFileCreatesTab = false;
             return;
         }
 
@@ -635,15 +654,19 @@ public sealed class PixologyGame : Game
             return;
         }
 
-        var buttonY = dialog.Bottom - 44;
-        if (new Rectangle(dialog.Right - 216, buttonY, 92, 32).Contains(mouse.Position))
+        var (openButton, cancelButton) = GetOpenFileDialogButtons(dialog);
+        if (openButton.Contains(mouse.Position))
             OpenSelectedFileEntry();
-        else if (new Rectangle(dialog.Right - 112, buttonY, 96, 32).Contains(mouse.Position))
+        else if (cancelButton.Contains(mouse.Position))
+        {
             _showOpenFileDialog = false;
+            _openFileCreatesTab = false;
+        }
     }
 
-    private void ShowOpenFileDialog()
+    private void ShowOpenFileDialog(bool createNewTab = false)
     {
+        _openFileCreatesTab = createNewTab;
         _openFileMessage = string.Empty;
         var preferenceMessage = string.Empty;
         if (string.IsNullOrEmpty(_openDirectory))
@@ -822,24 +845,30 @@ public sealed class PixologyGame : Game
 
             var pixels = new Color[image.Width * image.Height];
             image.GetData(pixels);
-            _canvasWidth = image.Width;
-            _canvasHeight = image.Height;
-            _canvasPixels = pixels;
-            _canvasSaveFileName = Path.GetFileNameWithoutExtension(path);
-            _layers.Clear();
-            _layers.Add(new Layer { Name = Path.GetFileNameWithoutExtension(path), Pixels = pixels });
-            _activeLayerIndex = 0;
-            _layerListOffset = 0;
-            RebuildCanvasTextures();
-            _undoHistory.Clear();
-            _activeTool = EditorTool.Brush;
-            _cropSelectionInitialized = false;
-            _showGrid = false;
-            _canvasPan = Vector2.Zero;
-            _zoom = 1f;
-            _saveMessage = string.Empty;
-            _isEditing = true;
+            var title = Path.GetFileNameWithoutExtension(path);
+            var document = new Document
+            {
+                Title = title,
+                FilePath = Path.GetFullPath(path),
+                Width = image.Width,
+                Height = image.Height,
+                Layers = new List<Layer> { new() { Name = title, Pixels = pixels } },
+                SaveFileName = title
+            };
+            if (_openFileCreatesTab || _activeDocumentIndex < 0)
+                AddDocument(document);
+            else
+            {
+                StoreActiveDocument();
+                var replacedIndex = _activeDocumentIndex;
+                _documents[replacedIndex] = document;
+                _activeDocumentIndex = -1;
+                ActivateDocument(replacedIndex);
+            }
+            if (!_openFileCreatesTab)
+                _activeTool = EditorTool.Brush;
             _showOpenFileDialog = false;
+            _openFileCreatesTab = false;
         }
         catch (UnauthorizedAccessException exception)
         {
@@ -857,6 +886,285 @@ public sealed class PixologyGame : Game
         {
             _openFileMessage = $"Unsupported or invalid image: {exception.Message}";
         }
+    }
+
+    private void CreateNewDocument()
+    {
+        var title = $"Untitled {_documents.Count + 1}";
+        var pixels = new Color[InitialCanvasSize * InitialCanvasSize];
+        AddDocument(new Document
+        {
+            Title = title,
+            Width = InitialCanvasSize,
+            Height = InitialCanvasSize,
+            Layers = new List<Layer> { new() { Name = "Layer 1", Pixels = pixels } },
+            SaveFileName = title
+        });
+    }
+
+    private void AddDocument(Document document)
+    {
+        _documents.Add(document);
+        ActivateDocument(_documents.Count - 1);
+    }
+
+    private void ActivateDocument(int index)
+    {
+        if (index < 0 || index >= _documents.Count || index == _activeDocumentIndex)
+            return;
+
+        if (_isDrawingStroke)
+            FinishStroke();
+        if (_isMovingSelection)
+            FinishSelectionMove();
+        if (_isAdjustingLayerOpacity)
+        {
+            _isAdjustingLayerOpacity = false;
+            if (_layerOpacityChanged)
+                _undoHistory.Push(_opacityDocumentSnapshot);
+            _opacityDocumentSnapshot = null!;
+            _layerOpacityChanged = false;
+        }
+
+        StoreActiveDocument();
+        _activeDocumentIndex = index;
+        var document = _documents[index];
+        _canvasWidth = document.Width;
+        _canvasHeight = document.Height;
+        _layers = document.Layers;
+        _undoHistory = document.UndoHistory;
+        _activeLayerIndex = Math.Clamp(document.ActiveLayerIndex, 0, _layers.Count - 1);
+        _layerListOffset = document.LayerListOffset;
+        _selectionBounds = document.SelectionBounds;
+        _showGrid = document.ShowGrid;
+        _cropSelection = document.CropSelection;
+        _cropSelectionInitialized = document.CropSelectionInitialized;
+        _canvasPan = document.CanvasPan;
+        _zoom = document.Zoom;
+        _canvasSaveFileName = document.SaveFileName;
+        _saveMessage = document.SaveMessage;
+        _canvasPixels = _layers[_activeLayerIndex].Pixels;
+        _isEditing = true;
+        _isDrawingStroke = false;
+        _isMovingSelection = false;
+        _isCreatingSelection = false;
+        _isCropping = false;
+        _isAdjustingLayerOpacity = false;
+        _isDraggingLayer = false;
+        _isLayerContextMenuOpen = false;
+        _isTabContextMenuOpen = false;
+        _colorPickerDrag = ColorPickerDrag.None;
+        RebuildCanvasTextures();
+    }
+
+    private void StoreActiveDocument()
+    {
+        if (_activeDocumentIndex < 0 || _activeDocumentIndex >= _documents.Count)
+            return;
+
+        var document = _documents[_activeDocumentIndex];
+        document.Width = _canvasWidth;
+        document.Height = _canvasHeight;
+        document.Layers = _layers;
+        document.UndoHistory = _undoHistory;
+        document.ActiveLayerIndex = _activeLayerIndex;
+        document.LayerListOffset = _layerListOffset;
+        document.SelectionBounds = _selectionBounds;
+        document.ShowGrid = _showGrid;
+        document.CropSelection = _cropSelection;
+        document.CropSelectionInitialized = _cropSelectionInitialized;
+        document.CanvasPan = _canvasPan;
+        document.Zoom = _zoom;
+        document.SaveFileName = _canvasSaveFileName;
+        document.SaveMessage = _saveMessage;
+    }
+
+    private (int FirstIndex, Rectangle[] Tabs, Rectangle NewButton, Rectangle OpenButton) GetTabStripLayout()
+    {
+        var viewport = GraphicsDevice.Viewport;
+        var right = Math.Max(12, viewport.Width - 140);
+        var available = Math.Max(0, right - 12);
+        var maximumVisible = Math.Max(1, (available + 4) / 76);
+        var visibleCount = Math.Min(_documents.Count, maximumVisible);
+        var firstIndex = Math.Clamp(_firstVisibleTabIndex, 0, Math.Max(0, _documents.Count - visibleCount));
+        if (_activeDocumentIndex >= 0 && _activeDocumentIndex < firstIndex)
+            firstIndex = _activeDocumentIndex;
+        else if (_activeDocumentIndex >= firstIndex + visibleCount)
+            firstIndex = _activeDocumentIndex - visibleCount + 1;
+        _firstVisibleTabIndex = firstIndex;
+
+        var tabWidth = visibleCount == 0
+            ? 144
+            : Math.Clamp((available - (visibleCount - 1) * 4) / visibleCount, 72, 144);
+        var tabs = new Rectangle[visibleCount];
+        for (var index = 0; index < visibleCount; index++)
+            tabs[index] = new Rectangle(12 + index * (tabWidth + 4), 2, tabWidth, 28);
+
+        return (
+            firstIndex,
+            tabs,
+            new Rectangle(viewport.Width - 124, 2, 34, 28),
+            new Rectangle(viewport.Width - 82, 2, 70, 28));
+    }
+
+    private Rectangle GetTabContextMenuBounds()
+    {
+        var width = Math.Min(TabContextMenuWidth, GraphicsDevice.Viewport.Width);
+        return new Rectangle(_tabContextMenuPosition.X, _tabContextMenuPosition.Y, width, TabContextMenuHeight);
+    }
+
+    private bool HandleTabContextMenuRightClick(Point position)
+    {
+        var layout = GetTabStripLayout();
+        for (var index = 0; index < layout.Tabs.Length; index++)
+        {
+            if (!layout.Tabs[index].Contains(position))
+                continue;
+
+            var viewport = GraphicsDevice.Viewport;
+            var width = Math.Min(TabContextMenuWidth, viewport.Width);
+            _contextMenuDocumentIndex = layout.FirstIndex + index;
+            _tabContextMenuPosition = new Point(
+                Math.Clamp(position.X, 0, Math.Max(0, viewport.Width - width)),
+                Math.Clamp(position.Y, 0, Math.Max(0, viewport.Height - TabContextMenuHeight)));
+            _isTabContextMenuOpen = true;
+            return true;
+        }
+
+        _isTabContextMenuOpen = false;
+        return false;
+    }
+
+    private bool HandleTabContextMenuClick(Point position)
+    {
+        if (!GetTabContextMenuBounds().Contains(position))
+        {
+            _isTabContextMenuOpen = false;
+            return false;
+        }
+
+        var item = new Rectangle(
+            _tabContextMenuPosition.X + 1,
+            _tabContextMenuPosition.Y + 1,
+            GetTabContextMenuBounds().Width - 2,
+            TabContextMenuHeight - 2);
+        if (item.Contains(position))
+            CloseDocument(_contextMenuDocumentIndex);
+        _isTabContextMenuOpen = false;
+        return true;
+    }
+
+    private void DrawTabContextMenu(MouseState mouse)
+    {
+        var menu = GetTabContextMenuBounds();
+        DrawRectangle(menu, PixologyPalette.Panel);
+        DrawOutline(menu, PixologyPalette.Ink, 1);
+        var item = new Rectangle(menu.X + 1, menu.Y + 1, menu.Width - 2, menu.Height - 2);
+        if (item.Contains(mouse.Position))
+            DrawRectangle(item, PixologyPalette.Accent);
+
+        const string label = "Delete";
+        var textSize = _font.MeasureString(label);
+        DrawPixelText(
+            label,
+            new Vector2(item.X + 10, MathF.Round(item.Center.Y - textSize.Y / 2)),
+            PixologyPalette.Ink);
+    }
+
+    private void CloseDocument(int index)
+    {
+        if (index < 0 || index >= _documents.Count)
+            return;
+
+        if (_isDrawingStroke)
+            FinishStroke();
+        if (_isMovingSelection)
+            FinishSelectionMove();
+        StoreActiveDocument();
+        _documents.RemoveAt(index);
+        _isTabContextMenuOpen = false;
+
+        if (_documents.Count == 0)
+        {
+            _activeDocumentIndex = -1;
+            CreateNewDocument();
+            return;
+        }
+
+        if (index < _activeDocumentIndex)
+        {
+            _activeDocumentIndex--;
+        }
+        else if (index == _activeDocumentIndex)
+        {
+            _activeDocumentIndex = -1;
+            ActivateDocument(Math.Min(index, _documents.Count - 1));
+        }
+
+        _firstVisibleTabIndex = Math.Clamp(_firstVisibleTabIndex, 0, Math.Max(0, _documents.Count - 1));
+    }
+
+    private static (Rectangle Open, Rectangle Cancel) GetOpenFileDialogButtons(Rectangle dialog)
+    {
+        const int openWidth = 92;
+        const int cancelWidth = 120;
+        const int gap = 12;
+        const int rightPadding = 16;
+        const int height = 32;
+        var y = dialog.Bottom - 44;
+        var cancel = new Rectangle(dialog.Right - rightPadding - cancelWidth, y, cancelWidth, height);
+        var open = new Rectangle(cancel.X - gap - openWidth, y, openWidth, height);
+        return (open, cancel);
+    }
+
+    private bool HandleTabStripClick(Point position)
+    {
+        var layout = GetTabStripLayout();
+        if (layout.NewButton.Contains(position))
+        {
+            CreateNewDocument();
+            return true;
+        }
+
+        if (layout.OpenButton.Contains(position))
+        {
+            ShowOpenFileDialog(createNewTab: true);
+            return true;
+        }
+
+        for (var index = 0; index < layout.Tabs.Length; index++)
+        {
+            if (!layout.Tabs[index].Contains(position))
+                continue;
+
+            ActivateDocument(layout.FirstIndex + index);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void DrawTabs(MouseState mouse)
+    {
+        var layout = GetTabStripLayout();
+        for (var index = 0; index < layout.Tabs.Length; index++)
+        {
+            var documentIndex = layout.FirstIndex + index;
+            var bounds = layout.Tabs[index];
+            var active = documentIndex == _activeDocumentIndex;
+            var hovered = bounds.Contains(mouse.Position);
+            DrawRectangle(bounds, active ? Color.White : hovered ? new Color(0xED, 0xF0, 0xFC) : PixologyPalette.Panel);
+            DrawOutline(bounds, active || hovered ? PixologyPalette.Ink : PixologyPalette.Border, active ? 2 : 1);
+            var title = FitText(_documents[documentIndex].Title, bounds.Width - 12);
+            var textSize = _font.MeasureString(title);
+            DrawPixelText(
+                title,
+                new Vector2(bounds.X + 6, MathF.Round(bounds.Center.Y - textSize.Y / 2)),
+                PixologyPalette.Ink);
+        }
+
+        DrawButton(layout.NewButton, "+", mouse);
+        DrawButton(layout.OpenButton, "Open", mouse);
     }
 
     private Rectangle GetOpenFileDialogBounds()
@@ -888,7 +1196,10 @@ public sealed class PixologyGame : Game
     private void DrawEditor(MouseState mouse)
     {
         var viewport = GraphicsDevice.Viewport;
-        DrawRectangle(new Rectangle(0, 0, viewport.Width, ToolbarHeight), PixologyPalette.Accent);
+        DrawRectangle(new Rectangle(0, 0, viewport.Width, TabStripHeight), PixologyPalette.Accent);
+        DrawRectangle(new Rectangle(0, TabStripHeight, viewport.Width, ToolbarHeight - TabStripHeight), PixologyPalette.Panel);
+        DrawTabs(mouse);
+        DrawRectangle(new Rectangle(0, TabStripHeight - 1, viewport.Width, 1), PixologyPalette.Border);
         DrawRectangle(new Rectangle(0, ToolbarHeight - 1, viewport.Width, 1), PixologyPalette.Border);
         DrawRectangle(new Rectangle(0, ToolbarHeight, SidebarWidth, viewport.Height - ToolbarHeight), PixologyPalette.Panel);
         DrawRectangle(new Rectangle(SidebarWidth - 1, ToolbarHeight, 1, viewport.Height - ToolbarHeight), PixologyPalette.Border);
@@ -896,24 +1207,24 @@ public sealed class PixologyGame : Game
         DrawRectangle(rightSidebar, PixologyPalette.Panel);
         DrawRectangle(new Rectangle(rightSidebar.X, rightSidebar.Y, 1, rightSidebar.Height), PixologyPalette.Border);
 
-        var saveButton = new Rectangle(12, 8, 92, 40);
+        var saveButton = new Rectangle(12, 40, 92, 40);
         DrawButton(saveButton, "Save", mouse);
 
-        DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), EditorTool.Select, mouse);
-        DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), EditorTool.Brush, mouse);
-        DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), EditorTool.Erase, mouse);
-        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), EditorTool.PaintBucket, mouse);
-        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), EditorTool.Crop, mouse);
-        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), EditorTool.Eyedropper, mouse);
+        DrawToolButton(new Rectangle(8, 104, SidebarWidth - 16, 56), EditorTool.Select, mouse);
+        DrawToolButton(new Rectangle(8, 168, SidebarWidth - 16, 56), EditorTool.Brush, mouse);
+        DrawToolButton(new Rectangle(8, 232, SidebarWidth - 16, 56), EditorTool.Erase, mouse);
+        DrawToolButton(new Rectangle(8, 296, SidebarWidth - 16, 56), EditorTool.PaintBucket, mouse);
+        DrawToolButton(new Rectangle(8, 360, SidebarWidth - 16, 56), EditorTool.Crop, mouse);
+        DrawToolButton(new Rectangle(8, 424, SidebarWidth - 16, 56), EditorTool.Eyedropper, mouse);
 
-        var checkbox = new Rectangle(124, 17, 22, 22);
+        var checkbox = new Rectangle(124, 49, 22, 22);
         DrawRectangle(checkbox, _showGrid ? PixologyPalette.CheckboxChecked : Color.White);
         DrawOutline(checkbox, PixologyPalette.Ink, 2);
 
         DrawVerticallyCenteredText("Show Grid", 158, checkbox.Center.Y);
         if (_activeTool == EditorTool.PaintBucket)
         {
-            var contiguousCheckbox = new Rectangle(312, 17, 22, 22);
+            var contiguousCheckbox = new Rectangle(312, 49, 22, 22);
             DrawRectangle(contiguousCheckbox, _bucketContiguous ? PixologyPalette.CheckboxChecked : Color.White);
             DrawOutline(contiguousCheckbox, PixologyPalette.Ink, 2);
 
@@ -921,7 +1232,7 @@ public sealed class PixologyGame : Game
         }
         else if (_activeTool == EditorTool.Erase)
         {
-            var magicCheckbox = new Rectangle(312, 17, 22, 22);
+            var magicCheckbox = new Rectangle(312, 49, 22, 22);
             DrawRectangle(magicCheckbox, _magicErase ? PixologyPalette.CheckboxChecked : Color.White);
             DrawOutline(magicCheckbox, PixologyPalette.Ink, 2);
 
@@ -936,6 +1247,8 @@ public sealed class PixologyGame : Game
         DrawToolIcons();
         _spriteBatch.End();
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp);
+        if (_isTabContextMenuOpen)
+            DrawTabContextMenu(mouse);
 
     }
 
@@ -1076,42 +1389,6 @@ public sealed class PixologyGame : Game
                 PixologyPalette.Ink,
                 1);
         }
-    }
-
-    private void HandleStartScreenClick(Point position)
-    {
-        var viewport = GraphicsDevice.Viewport;
-        var firstButton = new Rectangle(
-            (viewport.Width - (ButtonWidth * 2 + ButtonGap)) / 2,
-            (viewport.Height - ButtonHeight) / 2 + StartScreenVerticalOffset,
-            ButtonWidth,
-            ButtonHeight);
-
-        if (firstButton.Contains(position))
-        {
-            _canvasWidth = InitialCanvasSize;
-            _canvasHeight = InitialCanvasSize;
-            _canvasSaveFileName = "image";
-            _canvasPixels = new Color[_canvasWidth * _canvasHeight];
-            _layers.Clear();
-            _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
-            _activeLayerIndex = 0;
-            _layerListOffset = 0;
-            RebuildCanvasTextures();
-            _showGrid = false;
-            _activeTool = EditorTool.Brush;
-            _undoHistory.Clear();
-            _canvasPan = Vector2.Zero;
-            _zoom = 1f;
-            _saveMessage = string.Empty;
-            _isEditing = true;
-            return;
-        }
-
-        var secondButton = firstButton;
-        secondButton.X += ButtonWidth + ButtonGap;
-        if (secondButton.Contains(position))
-            ShowOpenFileDialog();
     }
 
     private void BeginStroke()
@@ -1863,64 +2140,64 @@ public sealed class PixologyGame : Game
         if (HandleLayerPanelClick(position))
             return;
 
-        if (new Rectangle(8, 72, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 104, SidebarWidth - 16, 56).Contains(position))
         {
             ActivateSelectionTool();
             return;
         }
 
-        if (new Rectangle(8, 136, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 168, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.Brush;
             return;
         }
 
-        if (new Rectangle(8, 200, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 232, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.Erase;
             return;
         }
 
-        if (new Rectangle(8, 264, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 296, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.PaintBucket;
             return;
         }
 
-        if (new Rectangle(8, 328, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 360, SidebarWidth - 16, 56).Contains(position))
         {
             ActivateCropTool();
             return;
         }
 
-        if (new Rectangle(8, 392, SidebarWidth - 16, 56).Contains(position))
+        if (new Rectangle(8, 424, SidebarWidth - 16, 56).Contains(position))
         {
             _activeTool = EditorTool.Eyedropper;
             return;
         }
 
-        if (new Rectangle(12, 8, 92, 40).Contains(position))
+        if (new Rectangle(12, 40, 92, 40).Contains(position))
         {
             SaveCanvas();
             return;
         }
 
-        if (new Rectangle(124, 17, 22, 22).Contains(position) ||
-            new Rectangle(154, 14, 130, 28).Contains(position))
+        if (new Rectangle(124, 49, 22, 22).Contains(position) ||
+            new Rectangle(154, 46, 130, 28).Contains(position))
         {
             _showGrid = !_showGrid;
             return;
         }
 
         if (_activeTool == EditorTool.PaintBucket &&
-            (new Rectangle(312, 17, 22, 22).Contains(position) ||
-             new Rectangle(344, 14, 140, 28).Contains(position)))
+            (new Rectangle(312, 49, 22, 22).Contains(position) ||
+             new Rectangle(344, 46, 140, 28).Contains(position)))
         {
             _bucketContiguous = !_bucketContiguous;
         }
         else if (_activeTool == EditorTool.Erase &&
-                 (new Rectangle(312, 17, 22, 22).Contains(position) ||
-                  new Rectangle(344, 14, 80, 28).Contains(position)))
+                 (new Rectangle(312, 49, 22, 22).Contains(position) ||
+                  new Rectangle(344, 46, 80, 28).Contains(position)))
         {
             _magicErase = !_magicErase;
         }
@@ -2156,6 +2433,12 @@ public sealed class PixologyGame : Game
         RefreshCompositeTexture();
         _canvas.SaveAsPng(stream, _canvasWidth, _canvasHeight);
         _saveMessage = $"Saved {fileName}.png to Desktop";
+        if (_activeDocumentIndex >= 0 && _activeDocumentIndex < _documents.Count)
+        {
+            _documents[_activeDocumentIndex].Title = fileName;
+            _documents[_activeDocumentIndex].FilePath = filePath;
+            StoreActiveDocument();
+        }
     }
 
     private void HandleScroll(MouseState mouse)
@@ -2723,12 +3006,12 @@ public sealed class PixologyGame : Game
     {
         var tools = new[]
         {
-            (new Rectangle(16, 0, 10, 10), 72),
-            (new Rectangle(0, 16, 10, 10), 136),
-            (new Rectangle(16, 16, 10, 10), 200),
-            (new Rectangle(32, 16, 10, 10), 264),
-            (new Rectangle(0, 32, 10, 10), 328),
-            (new Rectangle(32, 0, 10, 10), 392)
+            (new Rectangle(16, 0, 10, 10), 104),
+            (new Rectangle(0, 16, 10, 10), 168),
+            (new Rectangle(16, 16, 10, 10), 232),
+            (new Rectangle(32, 16, 10, 10), 296),
+            (new Rectangle(0, 32, 10, 10), 360),
+            (new Rectangle(32, 0, 10, 10), 424)
         };
         foreach (var (source, y) in tools)
         {
