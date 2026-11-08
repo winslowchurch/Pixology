@@ -20,8 +20,6 @@ public sealed class PixologyGame : Game
     private const int ToolbarHeight = 56;
     private const int SidebarWidth = 104;
     private const int RightSidebarWidth = 224;
-    private const float StartScreenTextScale = 3f;
-    private const float StartScreenButtonTextScale = 2f;
     private const float MinimumZoom = 0.25f;
     private const float MaximumZoom = 8f;
 
@@ -89,6 +87,7 @@ public sealed class PixologyGame : Game
     private SpriteFont _font = null!;
     private SpriteFont _titleFont = null!;
     private Texture2D _pixel = null!;
+    private Texture2D _toolIcons = null!;
     private Texture2D _canvas = null!;
     private Texture2D _checkerboard = null!;
     private Texture2D _saturationValueTexture = null!;
@@ -101,6 +100,7 @@ public sealed class PixologyGame : Game
     private bool _isEditing;
     private bool _showGrid;
     private bool _bucketContiguous = true;
+    private bool _magicErase;
     private bool _isDrawingStroke;
     private bool _strokeChanged;
     private bool _isPanning;
@@ -176,11 +176,12 @@ public sealed class PixologyGame : Game
     protected override void LoadContent()
     {
         _spriteBatch = new SpriteBatch(GraphicsDevice);
-        _font = Content.Load<SpriteFont>("PixelFont");
-        _titleFont = Content.Load<SpriteFont>("PixelFontTitle");
+        _font = Content.Load<SpriteFont>("AliceFont");
+        _titleFont = Content.Load<SpriteFont>("AliceTitle");
         _canvasRasterizer = new RasterizerState { ScissorTestEnable = true };
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
+        _toolIcons = Content.Load<Texture2D>("ui");
         _canvasPixels = new Color[_canvasWidth * _canvasHeight];
         _layers.Add(new Layer { Name = "Layer 1", Pixels = _canvasPixels });
         RebuildCanvasTextures();
@@ -331,8 +332,10 @@ public sealed class PixologyGame : Game
             _canvasPan.Y += mouse.Y - _previousMouse.Y;
         }
 
+        var singleClickTool = _activeTool == EditorTool.PaintBucket ||
+                              (_activeTool == EditorTool.Erase && _magicErase);
         if (_isEditing && _isDrawingStroke && leftPressed && !_isPanning &&
-            (_activeTool != EditorTool.PaintBucket || justPressedLeft))
+            (!singleClickTool || justPressedLeft))
         {
             var start = justPressedLeft ? mouse.Position : _previousMouse.Position;
             DrawOnCanvas(start, mouse.Position);
@@ -415,26 +418,26 @@ public sealed class PixologyGame : Game
         secondButton.X += ButtonWidth + ButtonGap;
 
         const string title = "Pixology";
-        var titleSize = _titleFont.MeasureString(title) * StartScreenTextScale;
+        var titleSize = _titleFont.MeasureString(title);
         var titlePosition = new Vector2(
             MathF.Round((viewport.Width - titleSize.X) / 2),
-            MathF.Round(firstButton.Y - titleSize.Y - 28));
-        DrawPixelText(_titleFont, title, titlePosition, PixologyPalette.TitleText, StartScreenTextScale);
+            MathF.Round(firstButton.Y - titleSize.Y - 8));
+        DrawPixelText(_titleFont, title, titlePosition, PixologyPalette.TitleText);
 
-        DrawButton(firstButton, "New", mouse, StartScreenButtonTextScale);
-        DrawButton(secondButton, "Open File", mouse, StartScreenButtonTextScale);
+        DrawButton(firstButton, "New", mouse, 1.15f);
+        DrawButton(secondButton, "Open File", mouse, 1.15f);
     }
 
     private void DrawOpenFileDialog(MouseState mouse)
     {
         var dialog = GetOpenFileDialogBounds();
-        DrawRectangle(dialog, new Color(246, 246, 246));
-        DrawOutline(dialog, Color.Black, 2);
-        DrawPixelText("Select an image", new Vector2(dialog.X + 16, dialog.Y + 12), Color.Black);
+        DrawRectangle(dialog, PixologyPalette.Panel);
+        DrawOutline(dialog, PixologyPalette.Ink, 2);
+        DrawPixelText("Select an image", new Vector2(dialog.X + 16, dialog.Y + 12), PixologyPalette.Ink);
         DrawPixelText(
             FitText(_openDirectory, dialog.Width - 32),
             new Vector2(dialog.X + 16, dialog.Y + 40),
-            Color.Black);
+            PixologyPalette.Ink);
 
         var upButton = new Rectangle(dialog.X + 16, dialog.Y + 66, 76, 30);
         var homeButton = new Rectangle(upButton.Right + 8, upButton.Y, 84, 30);
@@ -443,7 +446,7 @@ public sealed class PixologyGame : Game
 
         var listBounds = GetOpenFileListBounds(dialog);
         DrawRectangle(listBounds, Color.White);
-        DrawOutline(listBounds, Color.Black, 1);
+        DrawOutline(listBounds, PixologyPalette.Ink, 1);
         const int rowHeight = 24;
         var visibleCount = Math.Max(0, listBounds.Height / rowHeight);
         for (var row = 0; row < visibleCount; row++)
@@ -458,15 +461,21 @@ public sealed class PixologyGame : Game
                 listBounds.Width - 2,
                 rowHeight);
             if (entryIndex == _selectedOpenFileEntry)
-                DrawRectangle(rowBounds, new Color(190, 215, 245));
+                DrawRectangle(rowBounds, PixologyPalette.Accent);
 
             var entry = _openFileEntries[entryIndex];
-            var label = entry.IsDirectory ? $"[Folder] {entry.Name}" : entry.Name;
-            DrawPixelText(FitText(label, rowBounds.Width - 12), new Vector2(rowBounds.X + 6, rowBounds.Y + 3), Color.Black);
+            var labelX = rowBounds.X + 8;
+            if (entry.IsDirectory)
+            {
+                DrawFolderIcon(new Rectangle(rowBounds.X + 7, rowBounds.Y + 6, 18, 14));
+                labelX = rowBounds.X + 32;
+            }
+            var label = FitText(entry.Name, rowBounds.Right - labelX - 6);
+            DrawPixelText(label, new Vector2(labelX, rowBounds.Y + 3), PixologyPalette.Ink);
         }
 
         if (_openFileMessage.Length > 0)
-            DrawPixelText(FitText(_openFileMessage, dialog.Width - 32), new Vector2(dialog.X + 16, listBounds.Bottom + 3), Color.DarkRed);
+            DrawPixelText(FitText(_openFileMessage, dialog.Width - 32), new Vector2(dialog.X + 16, listBounds.Bottom + 3), PixologyPalette.Ink);
 
         var buttonY = dialog.Bottom - 44;
         var openButton = new Rectangle(dialog.Right - 216, buttonY, 92, 32);
@@ -799,36 +808,44 @@ public sealed class PixologyGame : Game
     private void DrawEditor(MouseState mouse)
     {
         var viewport = GraphicsDevice.Viewport;
-        DrawRectangle(new Rectangle(0, 0, viewport.Width, ToolbarHeight), new Color(246, 246, 246));
-        DrawRectangle(new Rectangle(0, ToolbarHeight - 1, viewport.Width, 1), new Color(210, 210, 210));
-        DrawRectangle(new Rectangle(0, ToolbarHeight, SidebarWidth, viewport.Height - ToolbarHeight), new Color(246, 246, 246));
-        DrawRectangle(new Rectangle(SidebarWidth - 1, ToolbarHeight, 1, viewport.Height - ToolbarHeight), new Color(210, 210, 210));
+        DrawRectangle(new Rectangle(0, 0, viewport.Width, ToolbarHeight), PixologyPalette.Accent);
+        DrawRectangle(new Rectangle(0, ToolbarHeight - 1, viewport.Width, 1), PixologyPalette.Border);
+        DrawRectangle(new Rectangle(0, ToolbarHeight, SidebarWidth, viewport.Height - ToolbarHeight), PixologyPalette.Panel);
+        DrawRectangle(new Rectangle(SidebarWidth - 1, ToolbarHeight, 1, viewport.Height - ToolbarHeight), PixologyPalette.Border);
         var rightSidebar = GetRightSidebarBounds(viewport);
-        DrawRectangle(rightSidebar, new Color(246, 246, 246));
-        DrawRectangle(new Rectangle(rightSidebar.X, rightSidebar.Y, 1, rightSidebar.Height), new Color(210, 210, 210));
+        DrawRectangle(rightSidebar, PixologyPalette.Panel);
+        DrawRectangle(new Rectangle(rightSidebar.X, rightSidebar.Y, 1, rightSidebar.Height), PixologyPalette.Border);
 
         var saveButton = new Rectangle(12, 8, 92, 40);
         DrawButton(saveButton, "Save", mouse);
 
-        DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), "Select", EditorTool.Select, mouse);
-        DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), "Brush", EditorTool.Brush, mouse);
-        DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), "Erase", EditorTool.Erase, mouse);
-        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), "Bucket", EditorTool.PaintBucket, mouse);
-        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), "Crop", EditorTool.Crop, mouse);
-        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), "Dropper", EditorTool.Eyedropper, mouse);
+        DrawToolButton(new Rectangle(8, 72, SidebarWidth - 16, 56), EditorTool.Select, mouse);
+        DrawToolButton(new Rectangle(8, 136, SidebarWidth - 16, 56), EditorTool.Brush, mouse);
+        DrawToolButton(new Rectangle(8, 200, SidebarWidth - 16, 56), EditorTool.Erase, mouse);
+        DrawToolButton(new Rectangle(8, 264, SidebarWidth - 16, 56), EditorTool.PaintBucket, mouse);
+        DrawToolButton(new Rectangle(8, 328, SidebarWidth - 16, 56), EditorTool.Crop, mouse);
+        DrawToolButton(new Rectangle(8, 392, SidebarWidth - 16, 56), EditorTool.Eyedropper, mouse);
 
         var checkbox = new Rectangle(124, 17, 22, 22);
         DrawRectangle(checkbox, _showGrid ? PixologyPalette.CheckboxChecked : Color.White);
-        DrawOutline(checkbox, Color.Black, 2);
+        DrawOutline(checkbox, PixologyPalette.Ink, 2);
 
-        DrawPixelText("Show Grid", new Vector2(154, 17), Color.Black);
+        DrawPixelText("Show Grid", new Vector2(154, 17), PixologyPalette.Ink);
         if (_activeTool == EditorTool.PaintBucket)
         {
             var contiguousCheckbox = new Rectangle(278, 17, 22, 22);
             DrawRectangle(contiguousCheckbox, _bucketContiguous ? PixologyPalette.CheckboxChecked : Color.White);
-            DrawOutline(contiguousCheckbox, Color.Black, 2);
+            DrawOutline(contiguousCheckbox, PixologyPalette.Ink, 2);
 
-            DrawPixelText("Contiguous", new Vector2(308, 17), Color.Black);
+            DrawPixelText("Contiguous", new Vector2(308, 17), PixologyPalette.Ink);
+        }
+        else if (_activeTool == EditorTool.Erase)
+        {
+            var magicCheckbox = new Rectangle(278, 17, 22, 22);
+            DrawRectangle(magicCheckbox, _magicErase ? PixologyPalette.CheckboxChecked : Color.White);
+            DrawOutline(magicCheckbox, PixologyPalette.Ink, 2);
+
+            DrawPixelText("Magic", new Vector2(308, 17), PixologyPalette.Ink);
         }
         DrawColorPicker(rightSidebar);
         DrawLayersPanel(rightSidebar, mouse);
@@ -849,8 +866,8 @@ public sealed class PixologyGame : Game
             (int)_font.MeasureString(message).X + 16,
             24);
         DrawRectangle(messageBounds, Color.White);
-        DrawOutline(messageBounds, new Color(210, 210, 210), 1);
-        DrawPixelText(message, new Vector2(messageBounds.X + 8, messageBounds.Y + 4), Color.Black);
+        DrawOutline(messageBounds, PixologyPalette.Border, 1);
+        DrawPixelText(message, new Vector2(messageBounds.X + 8, messageBounds.Y + 4), PixologyPalette.Ink);
     }
 
     private void DrawCanvasArea(Point mousePosition)
@@ -874,7 +891,7 @@ public sealed class PixologyGame : Game
             return;
 
         var pixelScale = canvasBounds.Width / _canvasWidth;
-        var toolSize = _activeTool == EditorTool.Erase ? 2 : 1;
+        var toolSize = _activeTool == EditorTool.Erase && !_magicErase ? 2 : 1;
         var cursorBounds = new Rectangle(
             canvasBounds.X + pixelX * pixelScale,
             canvasBounds.Y + pixelY * pixelScale,
@@ -889,7 +906,7 @@ public sealed class PixologyGame : Game
                 cursorBounds.Y + 2,
                 cursorBounds.Width - 4,
                 cursorBounds.Height - 4);
-            DrawOutline(innerBounds, Color.Black, 2);
+            DrawOutline(innerBounds, PixologyPalette.Ink, 2);
         }
     }
 
@@ -947,7 +964,7 @@ public sealed class PixologyGame : Game
         var labelPosition = new Vector2(
             Math.Clamp(mousePosition.X + 16, workspace.Left, workspace.Right - (int)labelSize.X),
             Math.Clamp(mousePosition.Y + 16, workspace.Top, workspace.Bottom - (int)labelSize.Y));
-        DrawPixelText(sizeLabel, labelPosition, Color.Black);
+        DrawPixelText(sizeLabel, labelPosition, PixologyPalette.Ink);
     }
 
     private void DrawLayerSelection(Rectangle canvasBounds)
@@ -970,7 +987,7 @@ public sealed class PixologyGame : Game
                     selectionBounds.Y + 2,
                     selectionBounds.Width - 4,
                     selectionBounds.Height - 4),
-                Color.Black,
+                PixologyPalette.Ink,
                 1);
         }
     }
@@ -1503,6 +1520,8 @@ public sealed class PixologyGame : Game
     {
         if (_activeTool == EditorTool.PaintBucket)
             return FillArea(x, y);
+        if (_activeTool == EditorTool.Erase && _magicErase)
+            return EraseMatchingPixels(x, y);
 
         var changed = false;
         var size = _activeTool == EditorTool.Erase ? 2 : 1;
@@ -1519,6 +1538,25 @@ public sealed class PixologyGame : Game
                 _canvasPixels[index] = color;
                 changed = true;
             }
+        }
+
+        return changed;
+    }
+
+    private bool EraseMatchingPixels(int x, int y)
+    {
+        var targetColor = _canvasPixels[y * _canvasWidth + x];
+        if (targetColor.A == 0)
+            return false;
+
+        var changed = false;
+        for (var index = 0; index < _canvasPixels.Length; index++)
+        {
+            if (_canvasPixels[index] != targetColor)
+                continue;
+
+            _canvasPixels[index] = Color.Transparent;
+            changed = true;
         }
 
         return changed;
@@ -1683,6 +1721,12 @@ public sealed class PixologyGame : Game
              new Rectangle(308, 14, 120, 28).Contains(position)))
         {
             _bucketContiguous = !_bucketContiguous;
+        }
+        else if (_activeTool == EditorTool.Erase &&
+                 (new Rectangle(278, 17, 22, 22).Contains(position) ||
+                  new Rectangle(308, 14, 76, 28).Contains(position)))
+        {
+            _magicErase = !_magicErase;
         }
     }
 
@@ -1971,48 +2015,48 @@ public sealed class PixologyGame : Game
     private void DrawColorPicker(Rectangle sidebar)
     {
         var bounds = GetColorPickerBounds(GraphicsDevice.Viewport);
-        DrawPixelText("Color", new Vector2(sidebar.X + 16, sidebar.Y + 4), Color.Black);
+        DrawPixelText("Color", new Vector2(sidebar.X + 16, sidebar.Y + 4), PixologyPalette.Ink);
         _spriteBatch.Draw(_saturationValueTexture, bounds.SaturationValue, Color.White);
         _spriteBatch.Draw(_hueTexture, bounds.Hue, Color.White);
 
         var hueMarkerY = bounds.Hue.Y + (int)MathF.Round(_selectedHue * (bounds.Hue.Height - 1));
         DrawOutline(new Rectangle(bounds.Hue.X - 2, hueMarkerY - 2, bounds.Hue.Width + 4, 5), Color.White, 1);
-        DrawOutline(bounds.SaturationValue, Color.Black, 1);
-        DrawOutline(bounds.Hue, Color.Black, 1);
+        DrawOutline(bounds.SaturationValue, PixologyPalette.Ink, 1);
+        DrawOutline(bounds.Hue, PixologyPalette.Ink, 1);
 
         var selectedX = bounds.SaturationValue.X +
                         (int)MathF.Round(_selectedSaturation * (bounds.SaturationValue.Width - 1));
         var selectedY = bounds.SaturationValue.Y +
                         (int)MathF.Round((1f - _selectedValue) * (bounds.SaturationValue.Height - 1));
         DrawOutline(new Rectangle(selectedX - 5, selectedY - 5, 11, 11), Color.White, 2);
-        DrawOutline(new Rectangle(selectedX - 2, selectedY - 2, 5, 5), Color.Black, 1);
+        DrawOutline(new Rectangle(selectedX - 2, selectedY - 2, 5, 5), PixologyPalette.Ink, 1);
 
         var hexColor = _hexSelected
             ? $"#{_hexEditText}{(_hexEditText.Length < 6 ? "_" : string.Empty)}"
             : GetSelectedHexColor();
-        DrawRectangle(bounds.HexBounds, _hexSelected ? new Color(50, 100, 170) : Color.White);
-        DrawOutline(bounds.HexBounds, Color.Black, 1);
-        DrawPixelText(hexColor, bounds.HexPosition, _hexSelected ? Color.White : Color.Black);
+        DrawRectangle(bounds.HexBounds, _hexSelected ? PixologyPalette.Accent : Color.White);
+        DrawOutline(bounds.HexBounds, PixologyPalette.Ink, 1);
+        DrawPixelText(hexColor, bounds.HexPosition, PixologyPalette.Ink);
     }
 
     private void DrawLayersPanel(Rectangle sidebar, MouseState mouse)
     {
         var bounds = GetLayersPanelBounds(sidebar);
-        DrawRectangle(new Rectangle(bounds.X, bounds.Y, bounds.Width, 1), new Color(210, 210, 210));
-        DrawPixelText("Layers", new Vector2(bounds.X + 12, bounds.Y + 8), Color.Black);
+        DrawRectangle(new Rectangle(bounds.X, bounds.Y, bounds.Width, 1), PixologyPalette.Border);
+        DrawPixelText("Layers", new Vector2(bounds.X + 12, bounds.Y + 8), PixologyPalette.Ink);
 
         var opacityBounds = GetLayerOpacityBounds(bounds);
-        DrawPixelText("Opacity", new Vector2(bounds.X + 12, opacityBounds.Y - 19), Color.Black);
+        DrawPixelText("Opacity", new Vector2(bounds.X + 12, opacityBounds.Y - 19), PixologyPalette.Ink);
         DrawRectangle(opacityBounds, Color.White);
-        DrawOutline(opacityBounds, Color.Black, 1);
+        DrawOutline(opacityBounds, PixologyPalette.Ink, 1);
         var markerX = opacityBounds.X + (int)MathF.Round(_layers[_activeLayerIndex].Opacity * (opacityBounds.Width - 1));
-        DrawRectangle(new Rectangle(opacityBounds.X, opacityBounds.Y + 1, markerX - opacityBounds.X, opacityBounds.Height - 2), new Color(155, 190, 230));
-        DrawRectangle(new Rectangle(markerX - 2, opacityBounds.Y - 2, 4, opacityBounds.Height + 4), Color.Black);
-        DrawPixelText($"{(int)MathF.Round(_layers[_activeLayerIndex].Opacity * 100)}%", new Vector2(opacityBounds.Right + 6, opacityBounds.Y - 2), Color.Black);
+        DrawRectangle(new Rectangle(opacityBounds.X, opacityBounds.Y + 1, markerX - opacityBounds.X, opacityBounds.Height - 2), PixologyPalette.Accent);
+        DrawRectangle(new Rectangle(markerX - 2, opacityBounds.Y - 2, 4, opacityBounds.Height + 4), PixologyPalette.Ink);
+        DrawPixelText($"{(int)MathF.Round(_layers[_activeLayerIndex].Opacity * 100)}%", new Vector2(opacityBounds.Right + 6, opacityBounds.Y - 2), PixologyPalette.Ink);
 
         var listBounds = GetLayerListBounds(bounds);
         DrawRectangle(listBounds, Color.White);
-        DrawOutline(listBounds, Color.Black, 1);
+        DrawOutline(listBounds, PixologyPalette.Ink, 1);
         const int rowHeight = 36;
         var visibleRows = Math.Max(0, listBounds.Height / rowHeight);
         for (var row = 0; row < visibleRows; row++)
@@ -2023,14 +2067,14 @@ public sealed class PixologyGame : Game
 
             var rowBounds = new Rectangle(listBounds.X + 1, listBounds.Y + 1 + row * rowHeight, listBounds.Width - 2, rowHeight);
             if (layerIndex == _activeLayerIndex)
-                DrawRectangle(rowBounds, new Color(190, 215, 245));
+                DrawRectangle(rowBounds, PixologyPalette.Accent);
             else if (_isDraggingLayer && layerIndex == _layerDropTargetIndex)
-                DrawRectangle(rowBounds, new Color(220, 232, 248));
+                DrawRectangle(rowBounds, new Color(0xED, 0xF0, 0xFC));
 
             DrawPixelText(
                 FitText(_layers[layerIndex].Name, rowBounds.Width - 12),
                 new Vector2(rowBounds.X + 6, rowBounds.Y + 9),
-                Color.Black);
+                PixologyPalette.Ink);
         }
 
         if (_isDraggingLayer && _layerDropTargetIndex >= 0)
@@ -2181,7 +2225,7 @@ public sealed class PixologyGame : Game
         var items = GetLayerContextMenuItems(_contextMenuLayerIndex);
         var menu = GetLayerContextMenuBounds(_layerContextMenuPosition, items.Length);
         DrawRectangle(menu, Color.White);
-        DrawOutline(menu, Color.Black, 1);
+        DrawOutline(menu, PixologyPalette.Ink, 1);
         for (var index = 0; index < items.Length; index++)
             DrawLayerContextMenuItem(menu, index, items[index], mouse);
     }
@@ -2205,12 +2249,12 @@ public sealed class PixologyGame : Game
     {
         var bounds = new Rectangle(menu.X + 1, menu.Y + 1 + item * 27, menu.Width - 2, 27);
         if (menuItem.Enabled && bounds.Contains(mouse.Position))
-            DrawRectangle(bounds, new Color(220, 232, 248));
+            DrawRectangle(bounds, new Color(0xED, 0xF0, 0xFC));
 
         DrawPixelText(
             menuItem.Label,
             new Vector2(bounds.X + 8, bounds.Y + 6),
-            menuItem.Enabled ? Color.Black : new Color(145, 145, 145));
+            menuItem.Enabled ? PixologyPalette.Ink : new Color(145, 145, 145));
     }
 
     private void SelectLayer(int layerIndex)
@@ -2452,35 +2496,40 @@ public sealed class PixologyGame : Game
             height);
     }
 
-    private void DrawToolButton(Rectangle bounds, string label, EditorTool tool, MouseState mouse)
+    private void DrawToolButton(Rectangle bounds, EditorTool tool, MouseState mouse)
     {
         var fill = _activeTool == tool
-            ? new Color(220, 232, 248)
-            : bounds.Contains(mouse.Position) ? new Color(242, 242, 242) : Color.White;
+            ? PixologyPalette.Accent
+            : bounds.Contains(mouse.Position) ? new Color(0xED, 0xF0, 0xFC) : Color.White;
         DrawRectangle(bounds, fill);
-        DrawOutline(bounds, _activeTool == tool ? new Color(70, 110, 160) : Color.Black, 2);
-
-        var textSize = _font.MeasureString(label);
-        var textPosition = new Vector2(
-            bounds.Center.X - textSize.X / 2,
-            bounds.Center.Y - textSize.Y / 2);
-        DrawPixelText(label, textPosition, Color.Black);
+        DrawOutline(bounds, _activeTool == tool ? PixologyPalette.Ink : PixologyPalette.Border, 2);
+        var source = tool switch
+        {
+            EditorTool.Select => new Rectangle(16, 0, 10, 10),
+            EditorTool.Eyedropper => new Rectangle(32, 0, 10, 10),
+            EditorTool.PaintBucket => new Rectangle(32, 16, 10, 10),
+            EditorTool.Brush => new Rectangle(0, 16, 10, 10),
+            EditorTool.Erase => new Rectangle(16, 16, 10, 10),
+            _ => new Rectangle(0, 32, 10, 10)
+        };
+        var icon = new Rectangle(bounds.Center.X - 16, bounds.Center.Y - 16, 32, 32);
+        _spriteBatch.Draw(_toolIcons, icon, source, PixologyPalette.Ink);
     }
 
     private void DrawButton(Rectangle bounds, string label, MouseState mouse, float textScale = 1f)
     {
         var hovered = bounds.Contains(mouse.Position);
-        var fill = hovered ? new Color(242, 242, 242) : Color.White;
+        var fill = hovered ? new Color(0xED, 0xF0, 0xFC) : Color.White;
         const int borderWidth = 2;
 
         DrawRectangle(bounds, fill);
-        DrawOutline(bounds, Color.Black, borderWidth);
+        DrawOutline(bounds, PixologyPalette.Ink, borderWidth);
 
         var textSize = _font.MeasureString(label) * textScale;
         var textPosition = new Vector2(
             bounds.Center.X - textSize.X / 2,
             bounds.Center.Y - textSize.Y / 2);
-        DrawPixelText(_font, label, textPosition, Color.Black, textScale);
+        DrawPixelText(_font, label, textPosition, PixologyPalette.Ink, textScale);
     }
 
     private void DrawPixelText(string text, Vector2 position, Color color)
@@ -2506,6 +2555,14 @@ public sealed class PixologyGame : Game
     private void DrawRectangle(Rectangle bounds, Color color)
     {
         _spriteBatch.Draw(_pixel, bounds, color);
+    }
+
+    private void DrawFolderIcon(Rectangle bounds)
+    {
+        DrawRectangle(new Rectangle(bounds.X, bounds.Y, 8, 4), PixologyPalette.Accent);
+        DrawRectangle(new Rectangle(bounds.X + 1, bounds.Y + 1, 6, 2), PixologyPalette.Ink);
+        DrawRectangle(new Rectangle(bounds.X, bounds.Y + 4, bounds.Width, bounds.Height - 4), PixologyPalette.Ink);
+        DrawRectangle(new Rectangle(bounds.X + 1, bounds.Y + 5, bounds.Width - 2, bounds.Height - 6), PixologyPalette.Accent);
     }
 
     private void DrawOutline(Rectangle bounds, Color color, int thickness)

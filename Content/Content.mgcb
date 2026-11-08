@@ -12,5 +12,6 @@
 
 #---------------------------------- Content ---------------------------------#
 
-/build:PixelFont.spritefont
-/build:PixelFontTitle.spritefont
+/build:AliceFont.spritefont
+/build:AliceTitle.spritefont
+/build:ui.png
