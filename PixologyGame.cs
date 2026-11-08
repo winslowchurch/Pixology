@@ -196,7 +196,7 @@ public sealed class PixologyGame : Game
             PreferredBackBufferHeight = 640
         };
 
-        Content.RootDirectory = "Content";
+        Content.RootDirectory = Path.Combine(AppContext.BaseDirectory, "Content");
         IsMouseVisible = true;
         Window.Title = "Pixology";
         Window.AllowUserResizing = true;

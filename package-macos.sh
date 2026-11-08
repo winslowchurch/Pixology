@@ -13,40 +13,22 @@ case "$RID" in
 esac
 
 PUBLISH_DIR="$ROOT_DIR/artifacts/publish-$RID"
-ICONSET_DIR="$ROOT_DIR/artifacts/Pixology.iconset"
 APP_DIR="$ROOT_DIR/dist/$RID/Pixology.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 
-rm -rf "$PUBLISH_DIR" "$ICONSET_DIR" "$APP_DIR"
-mkdir -p "$PUBLISH_DIR" "$ICONSET_DIR" "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
+rm -rf "$PUBLISH_DIR" "$APP_DIR"
+mkdir -p "$PUBLISH_DIR" "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 
 dotnet publish "$ROOT_DIR/Pixology.csproj" \
     --configuration Release \
     --runtime "$RID" \
-    --self-contained true \
+    --self-contained false \
     --output "$PUBLISH_DIR"
 
 ditto "$PUBLISH_DIR" "$CONTENTS_DIR/MacOS"
 
-create_icon()
-{
-    local size="$1"
-    local file_name="$2"
-    sips -s format png -z "$size" "$size" "$ROOT_DIR/Icon.bmp" \
-        --out "$ICONSET_DIR/$file_name" >/dev/null
-}
-
-create_icon 16 icon_16x16.png
-create_icon 32 icon_16x16@2x.png
-create_icon 32 icon_32x32.png
-create_icon 64 icon_32x32@2x.png
-create_icon 128 icon_128x128.png
-create_icon 256 icon_128x128@2x.png
-create_icon 256 icon_256x256.png
-create_icon 512 icon_256x256@2x.png
-create_icon 512 icon_512x512.png
-create_icon 1024 icon_512x512@2x.png
-iconutil --convert icns "$ICONSET_DIR" --output "$CONTENTS_DIR/Resources/Pixology.icns"
+sips -s format icns "$ROOT_DIR/Icon.bmp" \
+    --out "$CONTENTS_DIR/Resources/Pixology.icns" >/dev/null
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
